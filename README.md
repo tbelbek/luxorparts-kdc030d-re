@@ -1,158 +1,168 @@
-# Luxorparts KDC-030D — reverse-engineering notes
+# Luxorparts KDC-030D — reverse-engineering & shutter-lag fix
 
 Reverse-engineering my own **Luxorparts "Kamera för barn"** (pink kids' thermal-print
-camera, Kjell art. 66331, model **KDC-030D**) to explain, and hopefully fix, a
-**~1-second shutter lag**: pressing the shutter captures the frame roughly one second
+camera, Kjell art. **66331**, model **KDC-030D**) to explain and **fix** a
+**~1-second shutter lag**: pressing the shutter captured the frame roughly one second
 *after* the press, in every lighting condition.
 
 This repo holds the tooling and findings. It is defensive, educational RE of hardware I
-own. **No vendor firmware is redistributed here** — the reference BootROM/firmware images
-come from the upstream projects linked below; point `KDC_ROM_DIR` at your local copies.
+own. **No vendor firmware, BootROM or extracted assets are redistributed here** — the
+reference images come from the upstream projects linked below; point the env vars at your
+own local copies.
 
-> Status: **SOLVED — no case opening.** This unit's own firmware was dumped over USB (0xDA
-> BootROM loader + a hand-ported, position-independent flasher payload with its own SPI
-> driver — no vendor addresses, no SPI clip, no soldering). cmd0 returned JEDEC `5e4016`;
-> cmd1 returned real flash (BLDR boot header at +4). A 32 KiB app dump confirmed the
-> **shutter lag is a hard-coded ~1000-tick wait** in the capture routine: at RAM
-> `0x02007b48` (flash ≈ `0x9f48`) `l.addi r18,r24,1000` sets `deadline = uptime() + 1000`,
-> and the frame is grabbed only after that deadline — independent of exposure. See
-> [How the USB dump works](#how-the-usb-dump-works) and [The cause](#the-shutter-lag-cause).
-
-## How the USB dump works
-
-No case opening, no SPI clip. The chip is an AppoTech/Buildwin loader-capable SoC, so:
-
-1. **`0xDA`** (vendor SCSI) reboots the stock firmware into its on-chip **BootROM loader**
-   (`1908:3319` "BuildWin Video050Loader"), confirmed by USB/INQUIRY fingerprint.
-2. A small **position-independent flasher payload** (`tools/flstub.py` → `flasher.bin`, a
-   hand-port of matu's `boot/flasher.c`) is written to SRAM `0x2000` and launched through
-   the loader's `0xCB` "call" (it hands the payload its request block in `r3`). The payload
-   drives the SPI controller **with raw controller registers only** — it needs no
-   build-specific vendor function addresses, so it works on a stock camera.
-3. The payload runs command 0 (controller init + JEDEC check) then command 1 (flash read)
-   into its request block; the host reads the result back with a plain `0xCB` memory read.
-
-**What made it finally work:** the payload must preserve the callee-saved registers
-(`r14/r16/r18/r20`) it uses, or returning to the BootROM corrupts the loader and every
-follow-up USB transfer hangs. Earlier hand-assembled attempts skipped that and failed in
-six different ways; a compiled C payload preserves them automatically. The fix is in
-`flstub.py`'s entry/exit. The port is validated offline against a modeled CPU+SPI+flash
-(`tools/flsim.py`: terminates, returns the right bytes, only ever clocks `{0x9f,0x03,addr,0xFF}`).
+> **Status: SOLVED and FIXED — no case opening, no SPI clip, no soldering.**
+> This unit's firmware was dumped over USB, the lag was located in the capture routine, and
+> the fix was flashed back and **verified on the device** (shutter lag ~1 s → ~¼ s, exposure
+> unchanged). The whole read→patch→write→verify path runs through the stock USB port.
 
 ## The device
 
 | | |
 |---|---|
-| Product | Luxorparts Kamera för barn, pink — Kjell 66331 (blue = 66332), model KDC-030D |
-| SoC | **AppoTech / Buildwin JT5295** (AX3295B family), OpenRISC 1000, little-endian, **no branch delay slots** (a taken branch skips the next instruction; `l.jal` links to PC+4) |
-| Flash | 4 MiB SPI NOR (JEDEC `5e 40 16`) |
+| Product | Luxorparts Kamera för barn, pink — Kjell 66331 (blue = 66332), model **KDC-030D** |
+| SoC | **AppoTech / Buildwin JT5295** (AX3295B family), **OpenRISC 1000**, little-endian, **no branch delay slot** (a taken branch skips the next instruction; `l.jal` links r9 = PC+4) |
+| Flash | **4 MiB SPI NOR, Zbit ZB25VQ32** — JEDEC `5e 40 16` (0x5e = Zbit). 4 KiB sector erase `0x20`, 256 B page program `0x02`, 64 KiB block erase `0xd8` |
 | BootROM | 32 KiB @ `0x00100000`; **byte-identical** to penguin-camera's `soc_boot_rom.bin` (sha256 `62d4dabe…`) |
-| USB (stock) | `0219:3280` "GENERAL - AUDIO" → `1908:3283` "Buildwin Media-Player"; SCSI INQUIRY `Buildwin / Media-Player`; USB-SDK stamp `20160418V1.000` |
+| USB (stock) | `0219:3280` "GENERAL - AUDIO" → `1908:3283` "Buildwin Media-Player"; USB-SDK stamp `20160418V1.000` |
 | USB (loader) | `1908:3319` "BLDR v1.00" / "BuildWin Video050Loader" — reached by vendor SCSI `0xDA` |
-| SD card | `PHOTO/PHO#####.JPG` (9280×5160 interpolated, no EXIF), `VIDEO/`, `MP3/`. Plugging USB shows the card as mass storage and blanks the screen — normal, not a fault. |
+| SD card | `PHOTO/`, `VIDEO/`, `MP3/`. Plugging USB shows the card as mass storage and blanks the screen — normal. |
+
+## Firmware memory map (from the dump)
+
+```
+0x000000..0x0001ff  BootROM header: "BLDR" at +4, load address 0x02000000 at +0x20,
+                     start sector 18 (0x2400) at +0x24, load sector count (995) at +0x28,
+                     "SFAT" asset-table marker at +0x304
+0x000200..0x0023ff  vendor SRAM bootstrap (PLL/DDR calibration, vector table)
+0x002400..0x07ea00  application CODE — loaded contiguously to RAM 0x02000000 (509 KiB)
+0x07ea00..0x1ce000  DATA / assets (JPEG UI graphics, PCM sounds, bitmap font, SFAT dir)
+0x1ce000..0x400000  blank (0xFF)
+```
+RAM↔flash for the app: `RAM = flash_offset + 0x01ffdc00` (i.e. flash `0x2400` → RAM `0x02000000`).
 
 ## The shutter-lag cause
 
-Found by **offline** disassembly of penguin-camera's AX3295B stock firmware (a build on
-the same SoC + USB SDK as this camera — but *not* a dump of this unit, so this is a
-strong hypothesis, not proof for our exact build):
-
-The capture routine (RAM `0x02007460`) takes a start timestamp, then **blocks for a fixed
-~1000 ms** before grabbing the frame:
+Found by disassembling this unit's own app (`tools/or1k_dis.py`). The capture routine at
+RAM `0x02007460` waits for several subsystem-ready signals and then blocks for a **fixed
+~1000 ticks (tick ≈ 1 ms)** before grabbing the frame:
 
 ```
-r24 = uptime()                 # ms counter @ 0x0208671c   (0x02007908)
-deadline = r24 + 1000          #                            (0x02007a54)
-while uptime() < deadline: delay()   # fixed wait           (0x02007a58..0x02007a80)
-# only now: sensor grab + JPEG encode                        (0x02007a84+)
+0x02007b48:  l.addi r18,r24,1000      ; deadline = timestamp + 1000   (word 0x9e5803e8, flash 0x9f48)
+0x02007b4c…: uptime()/delay() loop until uptime >= deadline
+0x02007b78:  l.jal 0x02007164         ; the actual frame grab
 ```
 
-So the lag is a **hard-coded delay**, not auto-exposure settling — which matches the
-symptom being constant across lighting. A real fix means patching that constant and
-reflashing, which requires writing flash (out of scope until the read-only dump is done
-and the risk accepted).
+The wait body only calls `uptime()` (reads a ms counter at `0x02081284`) and `delay()` — no
+sensor/ISP/DMA access — so it is a pure fixed settle (AE/AWB convergence margin), independent
+of exposure, which matches the symptom being constant across lighting. The capture routine
+already waits on readiness flags *before* this, so the fixed 1000 is extra margin. **The fix
+lowers that one constant** (e.g. 1000 → 250) — two bytes at flash `0x9f48`.
+
+## How the USB read works
+
+No case opening, no SPI clip:
+
+1. **`0xDA`** (vendor SCSI) reboots the stock firmware into its on-chip **BootROM loader**
+   (`1908:3319`), confirmed by USB/INQUIRY fingerprint.
+2. A small **position-independent payload** (`tools/flstub.py`, a little-endian hand-port of
+   matu's `boot/flasher.c`) is written to SRAM `0x2000` and launched through the loader's
+   `0xCB` "call" (it hands the payload its request block in `r3`). The payload drives the SPI
+   controller **with raw controller registers only** — no build-specific vendor addresses, so
+   it runs on a stock camera.
+3. Request commands: `0` init+JEDEC, `1` flash read, `2` page program, `3` sector erase. The
+   host (`device/kdc_run.py`) builds the request, launches, and reads the result back.
+
+**What made it work:** the payload must preserve the callee-saved registers it uses
+(`r14/r16/r18/r20`) or returning to the BootROM corrupts the loader and USB hangs. The port
+is validated offline against a modeled CPU+SPI+flash (`tools/flsim.py`).
+
+## The fix (write path)
+
+The write payload (`flstub.build(window=(lo,hi))`) is **compile-time restricted** to a single
+address window, so it can physically only erase/program inside it. `device/kdc_run.py` drives
+the fix with heavy verification; **nothing is written unless the final argument is `WRITE`**:
+
+```bash
+# DRY RUN — reads only (JEDEC + the target sector), writes nothing:
+sudo python3 device/kdc_run.py flashpatch YOUR-4MB-DUMP.bin 250
+# COMMIT — erase + 16-page program + readback verify of sector 0x9000:
+sudo python3 device/kdc_run.py flashpatch YOUR-4MB-DUMP.bin 250 WRITE
+# RECOVERY — rewrite sector 0x9000 from the dump (stock value):
+sudo python3 device/kdc_run.py flashrestore YOUR-4MB-DUMP.bin WRITE
+```
+
+`250` is the new tick value (≈ 250 ms settle). Re-run with a different number to tune; the
+reflash is cheap, off the boot path, and recoverable.
+
+Safety model, in order:
+- **Full 4 MiB backup first** (`dump 0 0x400000`), then every write verifies against it.
+- **Erase-granule preflight** (committed writes only): in blank flash at `0x200000`, program a
+  marker into two adjacent 4 KiB sectors, erase one, and confirm the neighbour survives —
+  proving opcode `0x20` is a true 4 KiB sector erase on *this* chip before touching `0x9000`
+  (which shares a 64 KiB block with the boot sector). Zero risk: the scratch block is blank.
+- **Live == backup gate**: refuses to patch unless the on-chip sector still matches the backup.
+- **Window-guarded payload**: erase/program outside the target window is rejected in the payload.
+- **Readback verify** after erase (all-`0xFF`) and after program (byte-exact).
+- **Recovery is case-free**: the patch is off the boot/USB path, so a bad value still boots and
+  re-enters the `0xDA` loader; `flashrestore` rewrites the sector from the backup.
+
+## Safety — why this cannot brick the flash easily
+
+Every destructive SPI op (program `0x02`, erase `0x20`/`0xd8`, status-write `0x01`) is ignored
+by the chip until a **Write-Enable (`0x06`)** sets the WEL latch. The read payload emits only
+`{0x9f,0x03,addr,0xFF}`; the write payload adds only `{0x06,0x05,0x20,0x02}` and nothing else
+(`tools/flstub.py` prints the exact TX opcode set on build). `tools/flsim.py` asserts, offline,
+that no opcode outside the allow-list is ever clocked, that out-of-window/misaligned requests
+are rejected, that a transfer timeout reports failure (not a false success), and that a full
+erase→program→readback changes exactly the two patched bytes.
 
 ## Layout
 
 ```
-tools/
-  or1k_dis.py     minimal little-endian OpenRISC (ORBIS32) disassembler
-  flstub.py       the working flasher payload: a little-endian hand-port of matu's
-                  boot/flasher.c (cmd0 init+JEDEC, cmd1 flash read) -> flasher.bin.
-                  Needs no OpenRISC toolchain; its Asm emits LE words directly.
-  flsim.py        offline validator: runs flasher.bin on a modeled CPU+SPI+flash and
-                  checks it terminates, reads the right bytes, clocks only {0x9f,0x03,addr,0xFF}
-  stub_build.py   assembles the marker/reader/diag probe payloads (Asm lives here)
-  spi_trace.py    emulates the ROM SPI-read path; logs every byte clocked to TX (SPR 0x9250)
-  spi_frame.py    emulates it again; proves chip-select stays asserted for one transaction
-  stub_*.bin      small probe payloads (marker: zero-SPI launch test; reader/diag: experiments)
 device/
-  kdc_dump.py     loader entry + USB/BootROM fingerprinting + 0xCB memory read
-  kdc_run.py      flasher | dump | reader | marker | diag | stockread | bootrom
-                  (flasher = the working read; dump = loop it over a range to a file)
+  kdc_dump.py   loader entry + USB/BootROM fingerprinting + 0xCB memory read/write
+  kdc_run.py    flasher | dump | flashpatch | flashrestore | reader | marker | diag | bootrom
+tools/
+  flstub.py     the payload: LE hand-port of flasher.c (cmd 0/1/2/3) -> in-memory blob,
+                build(window=(lo,hi)) hard-restricts erase/program to that window
+  flsim.py      offline validator: CPU+SPI+flash model; runs the full write flow, the bounds
+                guards, and fault injection. Runs on a synthetic image with no dump present.
+  or1k_dis.py   minimal little-endian OpenRISC (ORBIS32) disassembler
+  stub_build.py the Asm (LE OpenRISC assembler) + marker/reader/diag probe payloads
+  spi_trace.py  / spi_frame.py   emulate the ROM SPI-read path (CS framing, TX opcode log)
+  stub_*.bin    small probe payloads (marker: zero-SPI launch test; reader/diag: experiments)
 ```
-
-Dump this unit's app region (needs the camera on its USB screen, SD volume unmounted):
-```bash
-sudo venv/bin/python device/kdc_run.py flasher 0 256              # proof: JEDEC + 256 bytes @ 0
-sudo venv/bin/python device/kdc_run.py dump 0x8000 0x8000 app.bin # 32 KiB incl. the capture routine
-```
-
-## Safety model (why this can't brick the flash)
-
-Every destructive SPI NOR operation (page program `0x02`, sector/block erase `0x20`/`0xD8`,
-status-register write `0x01`) is ignored by the chip until a **Write-Enable (`0x06`, WREN)**
-sets the write-enable latch. The reader payload (`stub_reader.bin`) **never emits `0x06`** —
-that opcode is not present in its code at all; `stub_build.py` scans the assembled bytes and
-confirms the only values ever sent to the TX register are `0x03` (READ), address bytes, and
-`0xFF`. Emulation (`spi_trace.py`, `spi_frame.py`) shows the same on the ROM read path and
-that chip-select is held for a single transaction, so address bytes are operands of the READ,
-never re-framed as commands. Consequently the worst realistic failure is a **bus hang that a
-power-cycle clears** (the loader watchdog resets the chip to stock after ~2 s), not a brick.
-
-This was independently reviewed; the review caught a real bug (an invalid `l.nop` encoding
-`0x54000000` instead of `0x15000000`) which is fixed.
-
-## Current status
-
-Proven **on-device** (read-only):
-- `0xDA` enters the BootROM loader; its USB/INQUIRY fingerprint matches the references.
-- This unit's 32 KiB BootROM is byte-identical to penguin-camera's (so the analyzed ROM
-  code applies here exactly).
-- The loader can accept an uploaded SRAM payload and launch it: **`stub_marker.bin` ran and
-  returned cleanly** (wrote `0xCAFE`), confirming SRAM write + launch + return.
-
-Remaining:
-- The read-only `stub_reader.bin` currently **hangs** because the SPI controller needs a
-  one-time clock/controller init in loader mode (`SPR 0x9000 = 0x01115005` plus clock-gate
-  writes — the exact sequence is in matu's `rom-rescue.c`, verified on hardware) that a bare
-  gate-enable doesn't provide. Porting that init (read-only) is the next step. A hang here is
-  recoverable by power-cycle; no flash write is possible (see safety model).
 
 ## Running (macOS)
 
 ```bash
 python3 -m venv venv && venv/bin/pip install pyusb
-export KDC_LIBUSB=/opt/homebrew/lib/libusb-1.0.dylib     # libusb for pyusb
-export KDC_ROM_DIR=/path/to/reference/roms               # holds soc_boot_rom.bin (+ optional bootrom_matu_64k.bin)
+export KDC_LIBUSB=/opt/homebrew/lib/libusb-1.0.dylib      # libusb for pyusb (default shown)
+export KDC_PENGUIN_REPO=/path/to/penguin-camera           # for tools/flsim.py (its or1k_subset)
+export KDC_DUMP=/path/to/your-4mb-dump.bin                # optional: real dump for flsim
+
 # camera powered on, connected, SD volume unmounted (diskutil unmountDisk /dev/diskN):
-sudo venv/bin/python device/kdc_run.py bootrom our_bootrom.bin   # read-only: dump+verify BootROM
-sudo venv/bin/python device/kdc_run.py marker                    # zero-SPI launch test
+sudo venv/bin/python device/kdc_run.py dump 0 0x400000 full_backup_4mb.bin   # full backup FIRST
+sudo venv/bin/python device/kdc_run.py flashpatch full_backup_4mb.bin 250    # dry run
+sudo venv/bin/python device/kdc_run.py flashpatch full_backup_4mb.bin 250 WRITE
+
+# offline self-test (no hardware; needs KDC_PENGUIN_REPO, dump optional):
+KDC_PENGUIN_REPO=/path/to/penguin-camera python3 tools/flsim.py
 ```
-Emulation needs no hardware (point `KDC_PENGUIN_REPO` at a penguin-camera checkout for its
-`or1k_subset.py`):
-```bash
-KDC_PENGUIN_REPO=/path/to/penguin-camera KDC_ROM_DIR=/path/to/roms python3 tools/spi_trace.py
-python3 tools/stub_build.py        # (re)assemble the stubs; prints the TX opcode allowlist
-```
+
+The camera returns to stock USB mode (`0219:3280`) after each loader run via its watchdog; if a
+command reports "camera not found in stock USB mode", power-cycle / re-plug and retry.
+
+See [AGENTS.md](AGENTS.md) for a contributor/agent orientation (chipset facts, ISA quirks,
+the exact workflow and the rules that keep writes safe).
 
 ## Credits / upstream (reference images live there, not here)
 
-- [matu6968/Action_Digital_Kids_Camera_DOOM](https://github.com/matu6968/Action_Digital_Kids_Camera_DOOM) — JT5295 SoC id, loader protocol, `rom-rescue.c`, `or1k_subset`-style tooling.
+- [matu6968/Action_Digital_Kids_Camera_DOOM](https://github.com/matu6968/Action_Digital_Kids_Camera_DOOM) — JT5295 SoC id, loader protocol, `boot/flasher.c`, `apxtool`.
 - [hidoba/penguin-camera](https://github.com/hidoba/penguin-camera) — AX3295B custom firmware, BootROM image, `or1k_subset.py`.
 - [GainSec: reverse engineering the MISIRUN instant-print camera](https://gainsec.com/2025/04/01/reverse-engineering-kids-instaprint-camera/) and the [Habr AX3295B teardown](https://habr.com/ru/companies/ruvds/articles/779626/).
 
 ## License
 
-MIT for the code in this repo (my own work). The referenced vendor firmware/BootROM images
-are **not** included and remain their respective owners'.
+MIT for the code in this repo (my own work). The referenced vendor firmware/BootROM/asset
+images are **not** included and remain their respective owners'.

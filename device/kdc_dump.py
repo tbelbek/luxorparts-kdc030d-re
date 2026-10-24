@@ -18,7 +18,9 @@ import hashlib, struct, sys, time
 from pathlib import Path
 import usb.core, usb.util, usb.backend.libusb1
 
-BACKEND = usb.backend.libusb1.get_backend(find_library=lambda _: '/opt/homebrew/lib/libusb-1.0.dylib')
+import os
+BACKEND = usb.backend.libusb1.get_backend(
+    find_library=lambda _: os.environ.get('KDC_LIBUSB', '/opt/homebrew/lib/libusb-1.0.dylib'))
 STOCK_IDS = ((0x0219, 0x3280), (0x1908, 0x3283))
 LOADER_ID = (0x1908, 0x3319)
 ROM_FN = 0x00102620                      # BootROM 0xCB memory helper, same address in both known ROMs

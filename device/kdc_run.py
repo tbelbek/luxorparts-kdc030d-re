@@ -18,6 +18,8 @@ try: sys.stdout.reconfigure(line_buffering=True)
 except Exception: pass
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / 'tools'))
+import flstub                                   # host builds window-guarded payloads in-memory
 ENTRY = 0x2000
 PARAM = 0x3900
 
@@ -79,7 +81,7 @@ def verify_bootrom(bot):
 
 def marker():
     bot = enter_loader()
-    stub = (HERE.parent / 're/stub_marker.bin').read_bytes()
+    stub = (HERE.parent / 'tools' / 'stub_marker.bin').read_bytes()
     sram_write(bot, ENTRY, stub)
     if bot.rom_read(ENTRY, len(stub)) != stub:
         sys.exit('stub upload readback mismatch; stop (SRAM write not working)')
@@ -97,7 +99,7 @@ def reader(offset, length):
     assert length <= 480 and offset >= 0
     bot = enter_loader()
     verify_bootrom(bot)
-    stub = (HERE.parent / 're/stub_reader.bin').read_bytes()
+    stub = (HERE.parent / 'tools' / 'stub_reader.bin').read_bytes()
     sram_write(bot, ENTRY, stub)
     if bot.rom_read(ENTRY, len(stub)) != stub:
         sys.exit('reader upload readback mismatch; stop')
@@ -148,12 +150,12 @@ def flasher(offset, length):
     # command 1 = flash read (addr<0x200000, len<=512 for SRAM). Retrieve via separate read (SRAM uncached).
     REQ = 0x3400                       # request block; flasher.S puts stack at REQ-0x110, save at REQ-0x100
     assert length <= 512
-    blob = (HERE.parent / 're' / 'flasher.bin').read_bytes()
+    blob = flstub.build()
     bot = enter_loader()
     sram_write(bot, ENTRY, blob)
     if bot.rom_read(ENTRY, len(blob)) != blob:
         sys.exit('flasher upload readback mismatch; stop')
-    print(f'flasher.bin uploaded at 0x{ENTRY:x} ({len(blob)} B)')
+    print(f'flasher payload uploaded at 0x{ENTRY:x} ({len(blob)} B)')
     def cmd(command, addr, n, payload=b''):
         hdr = struct.pack('<7I', 0x52585041, 1, command, addr, n, 1, 0)
         sram_write(bot, REQ, hdr + payload + b'\0' * (n - len(payload) if command != 1 else n))
@@ -178,7 +180,7 @@ def flasher(offset, length):
 def dumpflash(start, total, outpath):
     # Loop the proven flasher cmd1 in 256-byte chunks over [start, start+total) and save to a file.
     REQ = 0x3400
-    blob = (HERE.parent / 're' / 'flasher.bin').read_bytes()
+    blob = flstub.build()
     bot = enter_loader()
     sram_write(bot, ENTRY, blob)
     if bot.rom_read(ENTRY, len(blob)) != blob:
@@ -192,7 +194,7 @@ def dumpflash(start, total, outpath):
     print(f'  cmd0 init+JEDEC: status 0x{st:x} JEDEC {jd.hex()}')
     out = bytearray(); off = start
     while off < start + total:
-        n = min(256, start + total - off)
+        n = min(480, start + total - off)
         st, d = cmd(1, off, n)
         if st != 0 or len(d) != n:
             print(f'  stop at 0x{off:x}: status 0x{st:x} len {len(d)}'); break
@@ -204,10 +206,194 @@ def dumpflash(start, total, outpath):
     bot.release()
 
 
+MAGIC = 0x52585041
+SECTOR = 0x9000          # the 4KB sector holding the shutter-lag constant
+PATCH_OFF = 0x9f48       # flash offset of `l.addi r18,r24,1000` (word 0x9e5803e8)
+JEDEC = bytes([0x5e, 0x40, 0x16])
+
+
+def _mkcmd(bot):
+    REQ = 0x3400
+    def cmd(command, addr, n, payload=b''):
+        body = struct.pack('<7I', MAGIC, 1, command, addr, n, 1, 0) + payload
+        if command != 2:                       # non-program requests carry no page; pad read/erase buffer
+            body += b'\0' * n
+        sram_write(bot, REQ, body)
+        launch(bot, ENTRY, REQ)
+        status = struct.unpack('<I', bot.rom_read(REQ + 20, 4))[0]
+        data = bot.rom_read(REQ + 28, n) if (n and command in (0, 1)) else b''   # cmd0 JEDEC + cmd1 read
+        return status, data
+    return cmd
+
+
+def _read_range(cmd, addr, n):
+    out = bytearray(); off = 0
+    while off < n:
+        k = min(256, n - off)
+        st, d = cmd(1, addr + off, k)
+        if st != 0 or len(d) != k:
+            sys.exit(f'read @0x{addr + off:x} failed (status 0x{st:x})')
+        out += d; off += k
+    return bytes(out)
+
+
+def _write_sector(cmd, addr, data4k):
+    # erase one 4KB sector, program its 16 pages from data4k, verify readback. Exits on any failure.
+    assert addr & 0xfff == 0 and len(data4k) == 0x1000
+    RECOVER = ' (sector may be partial; your backup has the original — re-run with WRITE to retry, or run flashrestore)'
+    st, _ = cmd(3, addr, 0)
+    if st != 0: sys.exit(f'erase 0x{addr:x} failed (status 0x{st:x}){RECOVER}')
+    if _read_range(cmd, addr, 0x1000) != bytes([0xff]) * 0x1000:
+        sys.exit(f'0x{addr:x} not all-0xFF after erase (block-protect / bad erase); aborting before program{RECOVER}')
+    for p in range(16):
+        st, _ = cmd(2, addr + p * 256, 256, bytes(data4k[p * 256:(p + 1) * 256]))
+        if st != 0: sys.exit(f'program 0x{addr + p*256:x} failed (status 0x{st:x}){RECOVER}')
+    back = _read_range(cmd, addr, 0x1000)
+    if back != bytes(data4k):
+        bad = [addr + i for i in range(0x1000) if back[i] != data4k[i]]
+        sys.exit(f'verify 0x{addr:x} mismatch at {len(bad)} bytes {bad[:4]}{RECOVER}')
+
+
+def _upload_payload(bot, window):
+    # Build+upload a payload whose erase/program is HARD-restricted to [window) (compile-time guard).
+    blob = flstub.build(window=window)
+    sram_write(bot, ENTRY, blob)
+    if bot.rom_read(ENTRY, len(blob)) != blob:
+        sys.exit('flasher upload readback mismatch; stop')
+    print(f'  payload uploaded ({len(blob)} B, write-window 0x{window[0]:x}-0x{window[1]:x})')
+    return _mkcmd(bot)
+
+
+def _granule_preflight(bot):
+    # Prove opcode 0x20 erases EXACTLY 4KB (device-wide NOR property), using a BLANK scratch 64K block.
+    # If 0x20 erased a 64K block instead, erasing 0x9000 (same 64K block as the boot sector) would wipe
+    # sector 0 -> unbootable. The test is done in blank flash: even a 64K erase there destroys nothing.
+    # Writes are destructive, so this must run ONLY on a committed WRITE (not a dry run).
+    SCR, BLOCK = 0x200000, 0x10000                   # 64K-aligned scratch; whole block a 64K erase could hit
+    A, B = SCR, SCR + 0x1000                          # two adjacent 4KB sectors inside that block
+    cmd = _upload_payload(bot, (SCR, SCR + BLOCK))    # window spans the whole block (for the reset erases)
+    st, jd = cmd(0, 0, 3)
+    if st != 0 or jd != JEDEC: sys.exit('granule preflight: JEDEC probe failed')
+    # the WHOLE 64K block must be blank apart from leftover markers in A/B (so we never clobber live data,
+    # and an interrupted previous run self-heals rather than blocking)
+    block = _read_range(cmd, SCR, BLOCK)
+    # Every byte must be 0xFF, except the first 256 bytes of A and of B, where a leftover 0xA5 marker
+    # from an interrupted prior run is allowed. Anything else means real data we must NOT erase.
+    MARKER_B = 0xA5
+    stray = []
+    for off in range(BLOCK):
+        b = block[off]
+        if b == 0xff:
+            continue
+        in_marker = (0 <= off < 256) or (0x1000 <= off < 0x1100)   # A[0:256] or B[0:256]
+        if in_marker and b == MARKER_B:
+            continue
+        stray.append(SCR + off)
+    if stray:
+        sys.exit(f'granule preflight: scratch block 0x{SCR:x} has unexpected data at {[hex(x) for x in stray[:4]]} '
+                 f'({len(stray)} bytes); refusing to erase it')
+    for s in (A, B):                                  # reset A,B to blank (clears any interrupted prior run)
+        st, _ = cmd(3, s, 0)
+        if st != 0: sys.exit(f'granule preflight: scratch reset erase @0x{s:x} failed (status 0x{st:x})')
+    if _read_range(cmd, A, 0x2000) != bytes([0xff]) * 0x2000:
+        sys.exit('granule preflight: scratch did not go blank after reset erase')
+    marker = bytes([0xA5]) * 256
+    for s in (A, B):
+        st, _ = cmd(2, s, 256, marker)
+        if st != 0: sys.exit(f'granule preflight: marker program @0x{s:x} failed (status 0x{st:x})')
+    st, _ = cmd(3, A, 0)                              # erase ONLY sector A
+    if st != 0: sys.exit(f'granule preflight: test erase @0x{A:x} failed (status 0x{st:x})')
+    a_blank = _read_range(cmd, A, 256) == bytes([0xff]) * 256
+    b_intact = _read_range(cmd, B, 256) == marker
+    print(f'  granule test: 0x{A:x} erased->blank={a_blank}, neighbour 0x{B:x} intact={b_intact}')
+    if not (a_blank and b_intact):
+        sys.exit('ERASE GRANULE IS NOT 4KB — 0x20 wiped the neighbouring sector! '
+                 'Refusing to touch 0x9000 (it shares a 64K block with the boot sector).')
+    st, _ = cmd(3, B, 0)                              # cleanup: leave scratch blank, verified, for next run
+    if st != 0 or _read_range(cmd, A, 0x2000) != bytes([0xff]) * 0x2000:
+        sys.exit(f'granule preflight: scratch cleanup incomplete (status 0x{st:x}); manually erase 0x{A:x}/0x{B:x} before retrying')
+    print('  CONFIRMED: 0x20 = 4KB sector erase on this chip; erasing 0x9000 stays within its own 4KB sector.')
+
+
+def _build_patched(backup, ticks):
+    assert 0 <= ticks <= 0xffff, 'ticks must fit the addi immediate (0..65535)'
+    cur = struct.unpack_from('<I', backup, PATCH_OFF)[0]
+    if (cur >> 16) != 0x9e58:
+        sys.exit(f'backup word @0x{PATCH_OFF:x} is 0x{cur:08x}, not l.addi r18,r24,imm (0x9e58xxxx); refusing')
+    patched = bytearray(backup[SECTOR:SECTOR + 0x1000])
+    struct.pack_into('<I', patched, PATCH_OFF - SECTOR, 0x9e580000 | ticks)
+    diff = [SECTOR + i for i in range(0x1000) if patched[i] != backup[SECTOR + i]]
+    assert diff == [0x9f48, 0x9f49], f'unexpected diff {diff}; refusing'
+    return bytes(patched), cur
+
+
+def flashpatch(backup_path, ticks, confirm):
+    # Lower the shutter-lag constant and reflash ONLY sector 0x9000. Dry-run unless confirm=='WRITE'.
+    backup = open(backup_path, 'rb').read()
+    assert len(backup) >= 0x10000, 'backup too short (need >=64KB)'
+    orig_sector = backup[SECTOR:SECTOR + 0x1000]
+    patched, cur = _build_patched(backup, ticks)
+    print(f'patch: flash 0x{PATCH_OFF:x} 0x{cur:08x} -> 0x{0x9e580000 | ticks:08x}  (imm {cur & 0xffff} -> {ticks} ticks); 2 bytes @0x9f48,0x9f49')
+
+    bot = enter_loader()
+    # READ-ONLY phase (also the whole of a dry run): JEDEC + live-sector gate, no flash writes.
+    cmd = _upload_payload(bot, (SECTOR, SECTOR + 0x1000))   # payload can ONLY erase/program sector 0x9000
+    st, jd = cmd(0, 0, 3)
+    print(f'  cmd0 init+JEDEC: status 0x{st:x} JEDEC {jd.hex()} (expect 5e4016)')
+    if st != 0 or jd != JEDEC:
+        bot.release(); sys.exit('JEDEC probe failed; refusing to write')
+    live = _read_range(cmd, SECTOR, 0x1000)
+    if live == patched:
+        print('  live sector ALREADY matches the patched image — nothing to do.'); bot.release(); return
+    if live != orig_sector:
+        bad = [SECTOR + i for i in range(0x1000) if live[i] != orig_sector[i]]
+        bot.release(); sys.exit(f'LIVE sector 0x{SECTOR:x} matches NEITHER backup NOR patched ({len(bad)} bytes differ from backup, first {bad[:4]}). '
+                                f'It may be half-written. Run:  flashrestore {backup_path} WRITE  (rewrites this sector from backup). Refusing to patch.')
+    print(f'  live sector 0x{SECTOR:x} matches backup exactly — safe to proceed')
+
+    if confirm != 'WRITE':
+        print('\nDRY RUN (nothing written — only JEDEC + sector read). Re-run with final arg WRITE to erase+program.')
+        bot.release(); return
+
+    # COMMITTED WRITE path only: prove the erase granule (writes blank scratch), then patch 0x9000.
+    print('\nerase-granule preflight (writes a blank scratch block, proves 0x20 = 4KB)...')
+    _granule_preflight(bot)
+    cmd = _upload_payload(bot, (SECTOR, SECTOR + 0x1000))   # re-upload the 0x9000-windowed payload
+    print('\n*** WRITING sector 0x9000 (erase + 16 pages + verify) ***')
+    _write_sector(cmd, SECTOR, patched)        # guarded to 0x9000; exits with a recovery hint on any failure
+    print('  VERIFY OK: sector matches patched image; only 0x9f48,0x9f49 changed vs backup.')
+    print('  DONE. Power-cycle the camera and test the shutter.')
+    bot.release()
+
+
+def flashrestore(backup_path, confirm):
+    # Recovery: rewrite sector 0x9000 from the backup (no equality gate). Dry-run unless confirm=='WRITE'.
+    backup = open(backup_path, 'rb').read()
+    assert len(backup) >= 0x10000, 'backup too short'
+    orig_sector = backup[SECTOR:SECTOR + 0x1000]
+    bot = enter_loader()
+    cmd = _upload_payload(bot, (SECTOR, SECTOR + 0x1000))
+    st, jd = cmd(0, 0, 3)
+    print(f'  cmd0 init+JEDEC: status 0x{st:x} JEDEC {jd.hex()}')
+    if st != 0 or jd != JEDEC: bot.release(); sys.exit('JEDEC probe failed; refusing')
+    live = _read_range(cmd, SECTOR, 0x1000)
+    print(f'  live sector 0x{SECTOR:x} == backup? {live == orig_sector}')
+    if confirm != 'WRITE':
+        print('\nDRY RUN (nothing written — only JEDEC + sector read). Re-run with final arg WRITE to erase+reprogram from backup.')
+        bot.release(); return
+    print('\nerase-granule preflight (writes a blank scratch block, proves 0x20 = 4KB)...')
+    _granule_preflight(bot)
+    cmd = _upload_payload(bot, (SECTOR, SECTOR + 0x1000))   # re-upload the 0x9000-windowed payload
+    print('\n*** RESTORING sector 0x9000 from backup ***')
+    _write_sector(cmd, SECTOR, orig_sector)
+    print('  RESTORE OK: sector 0x9000 matches backup. Power-cycle to return to stock.')
+    bot.release()
+
+
 def diag(which):
     # Diagnostic ladder: does reading an SPR in the loader fault? Upload a minimal stub that
     # reads one SPR and returns; retrieve stage+value via SEPARATE reads (marker-proven path).
-    stub = (HERE.parent / 're' / f'stub_diag_{which}.bin').read_bytes()
+    stub = (HERE.parent / 'tools' / f'stub_diag_{which}.bin').read_bytes()
     bot = enter_loader()
     sram_write(bot, ENTRY, stub)
     if bot.rom_read(ENTRY, len(stub)) != stub:
@@ -262,6 +448,17 @@ if __name__ == '__main__':
     elif len(sys.argv) >= 2 and sys.argv[1] == 'flasher':
         flasher(int(sys.argv[2], 0) if len(sys.argv) > 2 else 0,
                 int(sys.argv[3], 0) if len(sys.argv) > 3 else 256)
+    elif len(sys.argv) >= 2 and sys.argv[1] == 'flashpatch':
+        # flashpatch BACKUP [TICKS=200] [WRITE]   (dry run unless last arg is exactly WRITE)
+        bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
+        tk = int(sys.argv[3], 0) if len(sys.argv) > 3 else 200
+        cf = sys.argv[4] if len(sys.argv) > 4 else 'DRY'
+        flashpatch(bpath, tk, cf)
+    elif len(sys.argv) >= 2 and sys.argv[1] == 'flashrestore':
+        # flashrestore BACKUP [WRITE]   (restores sector 0x9000 from backup; dry run unless WRITE)
+        bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
+        cf = sys.argv[3] if len(sys.argv) > 3 else 'DRY'
+        flashrestore(bpath, cf)
     elif len(sys.argv) >= 2 and sys.argv[1] == 'diag':
         diag(sys.argv[2] if len(sys.argv) > 2 else 'core')
     elif len(sys.argv) >= 2 and sys.argv[1] == 'stockread':

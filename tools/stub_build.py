@@ -17,8 +17,8 @@ Entry convention (from apxtool rom_rescue / rom-rescue.S): the loader calls the
 payload at its first instruction with r3 = param-block pointer, link in r9; the
 payload returns with l.jr r9. Payload lives at SRAM 0x2000.
 """
-import struct, sys
-sys.path.insert(0, '/private/tmp/claude-501/-Users-tbelbek--claude-spares-spare-ifmGrF/3f8797bd-678d-4de2-97be-a71b1a559292/scratchpad/re')
+import os, struct, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 GATE = 0x00101018          # ROM: enable SPI controller clock gates (no SPI bytes)
 XCHG = 0x0010485c          # ROM: one-byte SPI exchange (TX r3 -> RX r11)
@@ -215,7 +215,7 @@ if __name__ == '__main__':
         print(f'=== {name}: {len(blob)} bytes ===')
         # self-verify by disassembling
         r = subprocess.run(['python3', '-I',
-            '/private/tmp/claude-501/-Users-tbelbek--claude-spares-spare-ifmGrF/3f8797bd-678d-4de2-97be-a71b1a559292/scratchpad/re/or1k_dis.py',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'or1k_dis.py'),
             path, f'{ENTRY:x}', '0', f'{len(blob):x}'], capture_output=True, text=True)
         print(r.stdout or r.stderr)
         # scan for any dangerous opcode byte baked as an immediate 0x06/0x20/0xd8/0xc7/0x02/0x01/0x50 to r3 before an XCHG
