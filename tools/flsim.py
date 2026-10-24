@@ -189,11 +189,15 @@ def main():
     cpu = Sim(win)
     st, data, tx, steps = run_cmd(cpu, 0, 0, 3)
     print(f'  {steps} steps; status=0x{st:x}; JEDEC={data.hex()} (expect 5e4016); ok={data == bytes([0x5e,0x40,0x16])}')
+    assert st in (0, 3), f'cmd0 init bad status 0x{st:x} (0 or 3 expected)'   # 3 = JEDEC 5e4016 vs flasher's 5e4015
+    assert data == bytes([0x5e, 0x40, 0x16]), f'cmd0 JEDEC {data.hex()} != 5e4016'
 
     print('=== cmd1 (read the patch window @0x9f40, before any write) ===')
     cpu = Sim(win)
     st, data, tx, steps = run_cmd(cpu, 1, 0x9f40, 16)
     print(f'  status=0x{st:x}; data={data.hex()} == backup? {data == backup[0x9f40:0x9f50]}')
+    assert st == 0, f'cmd1 initial read bad status 0x{st:x}'
+    assert data == backup[0x9f40:0x9f50], 'cmd1 initial read != backup'
 
     print('=== FULL write flow on ONE device: erase 0x9000 -> program 16 pages (patched) -> read back ===')
     cpu = Sim(win)
@@ -202,6 +206,8 @@ def main():
     st, _, tx, steps = run_cmd(cpu, 3, SECTOR, 0)
     erased = cpu.flash.mem[SECTOR:SECTOR + 0x1000]
     print(f'  erase: status=0x{st:x}; sector all-0xFF after erase? {erased == bytes([0xff])*0x1000}')
+    assert st == 0, f'erase bad status 0x{st:x}'
+    assert erased == bytes([0xff]) * 0x1000, 'erase did not blank the whole sector'
     # program 16 pages from the patched sector
     pstatus = []
     for p in range(16):
@@ -209,11 +215,14 @@ def main():
         st, _, _, _ = run_cmd(cpu, 2, a, 256, bytes(patched_sector[p*256:(p+1)*256]))
         pstatus.append(st)
     print(f'  program 16 pages: all status 0? {all(s == 0 for s in pstatus)}  statuses={[hex(s) for s in pstatus]}')
+    assert all(s == 0 for s in pstatus), f'a program page returned non-zero status: {[hex(s) for s in pstatus]}'
     # read back the whole sector via the payload's own read path, in 256B chunks
     readback = bytearray()
+    rstatus = []
     for p in range(16):
         st, d, _, _ = run_cmd(cpu, 1, SECTOR + p*256, 256)
-        readback += d
+        rstatus.append(st); readback += d
+    assert all(s == 0 for s in rstatus), f'a readback returned non-zero status: {[hex(s) for s in rstatus]}'
     print(f'  readback == patched_sector? {bytes(readback) == bytes(patched_sector)}')
     print(f'  readback == original (unpatched)? {bytes(readback) == orig_sector}  (must be False)')
     print(f'  bytes that differ from original: {[hex(SECTOR+i) for i in range(0x1000) if readback[i] != orig_sector[i]]}')
@@ -233,6 +242,10 @@ def main():
     assert untouched == now, 'memory OUTSIDE sector 0x9000 changed!'
     assert bytes(readback) == bytes(patched_sector), 'readback mismatch'
     assert bytes(readback) != orig_sector, 'patch had no effect'
+    assert bytes(cpu.flash.mem[SECTOR:SECTOR + 0x1000]) == bytes(patched_sector), 'physical sector != patched_sector'
+    changed = {i for i in range(0x1000) if readback[i] != orig_sector[i]}
+    assert changed == {a - SECTOR for a in PATCH}, (
+        f'changed set {sorted(hex(SECTOR+i) for i in changed)} != PATCH {sorted(hex(a) for a in PATCH)}')
     print(f'  OK: 1 erase @0x{SECTOR:x}, {len(programs)} programs all in-sector, nothing outside sector 0x9000 changed.')
     print(f'  OK: only 2 bytes changed vs backup: 0x9f48 e8->c8, 0x9f49 03->00.')
 
@@ -251,6 +264,8 @@ def main():
         ('program @0x9000 len 300 (>256)', 2, 0x9000, 300, bytes(300)),
         ('program @0x90f0 len 32 (page cross)', 2, 0x90f0, 32, bytes(32)),
         ('program @0x8000 (below window)', 2, 0x8000, 16, bytes(16)),
+        ('program @0xa000 (at upper window edge)', 2, 0xa000, 16, bytes(16)),
+        ('program @0x9000 len 0 (zero-length)', 2, 0x9000, 0, b''),
     ]
     all_rejected = True
     for name, c, a, n, pl in cases:
@@ -267,6 +282,16 @@ def main():
     print(f'  erase with stuck transfer: status=0x{st:x} (expect 2 = byte timeout), terminated in {steps} steps')
     assert st == 2, 'byte() timeout was swallowed or mis-reported (regression of Codex finding #1)'
     assert c.flash.ops == [], 'a write happened despite the transfer fault'
+    # delayed timeout: a couple of polls complete, then the controller wedges mid-sequence.
+    c = Sim(win); c.ok9248 = 2
+    st, _, _, steps = run_cmd(c, 3, SECTOR, 0, limit=12_000_000)
+    print(f'  erase, transfer wedges after 2 polls: status=0x{st:x} (expect 2), terminated in {steps} steps')
+    assert st == 2, 'delayed byte() timeout not reported'
+    # read path must also surface a stuck transfer, not return stale success.
+    c = Sim(win); c.ok9248 = 0
+    st, _, _, steps = run_cmd(c, 1, SECTOR, 16, limit=12_000_000)
+    print(f'  read with stuck transfer: status=0x{st:x} (expect != 0), terminated in {steps} steps')
+    assert st != 0, 'read with a stuck transfer reported success'
 
     print('=== WINDOW PARAMETERISATION (a payload built for a different window enforces it) ===')
     scratch_blob = flstub.build(window=(0x3000, 0x4000))

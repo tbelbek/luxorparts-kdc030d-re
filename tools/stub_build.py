@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-"""Hand-assemble two OpenRISC (JT5295 no-delay-slot, little-endian) SRAM payloads
+"""Hand-assemble the OpenRISC (JT5295 no-delay-slot, little-endian) marker SRAM payload
 for the forced BootROM loader:
 
   marker  : zero-SPI probe. r3 = param block; stores 0x0000CAFE at [r3+12]; returns.
             Proves the loader launches an SRAM payload (callback) and it returns,
             touching NO SPI and NO flash.
-  reader  : READ-ONLY flash reader. Orchestrates verified ROM primitives:
-            0x101018 gate-enable, 0x10485c one-byte SPI exchange; CS via SPR 0x9000
-            bit 0x4000 (clear=assert, set=deassert, exactly as ROM 0x104898/0x1048c8).
-            Sends ONLY {0x03, three address bytes, 0xFF}. No 0x06/0x20/0xD8/0x02/0x01/0x50
-            opcode is emitted or even present in the code. Worst case: a hang (the flash
-            cannot be modified without a WREN we never send). Params at [r3]:
-              +0 flash_offset  +4 length(<=480)  +8 dest(SRAM)  +12 status(out)
+
+(The read/erase/program SPI payload that ships lives in tools/flstub.py, window-guarded
+and offline-validated by tools/flsim.py; the earlier reader/diag bring-up probes were
+retired once flstub/dumpflash superseded them.)
 
 Entry convention (from apxtool rom_rescue / rom-rescue.S): the loader calls the
 payload at its first instruction with r3 = param-block pointer, link in r9; the
@@ -115,102 +112,11 @@ SAVED_SPRS = [0x880c, 0x8100, 0x8040, 0x8000, 0x9000, 0x9004, 0x9008, 0x900c,
 SAVE_AREA = 0x3600
 
 
-def diag(spr):
-    """Minimal returning stub: sentinel -> read one SPR into param+16 -> DONE. Isolates whether
-    reading SPR `spr` faults/hangs. Retrieved via a separate read (as the marker proved works)."""
-    a = Asm(ENTRY)
-    a.const(1, 0x37f0)
-    a.ori(14, 9, 0)                    # save loader return
-    a.ori(16, 3, 0)                    # r16 = param
-    a.const(4, 0xD1A60000); a.sw(16, 12, 4)   # stage sentinel (reached entry)
-    a.mfspr(5, 0, spr); a.sw(16, 16, 5)       # <-- the SPR under test
-    a.const(4, 0x0000D04E); a.sw(16, 12, 4)   # DONE (reached the end -> no fault)
-    a.jr(14); a.nop()
-    return a.finish()
-
-
-def reader():
-    a = Asm(ENTRY)
-    a.const(1, 0x37f0)                 # stack
-    a.ori(14, 9, 0)                    # r14 = loader return address
-    a.ori(16, 3, 0)                    # r16 = param block
-    a.const(15, SAVE_AREA)             # r15 = SPR save area
-    for i, spr in enumerate(SAVED_SPRS):           # snapshot originals BEFORE touching anything
-        a.mfspr(5, 0, spr); a.sw(15, i * 4, 5)
-    a.wrspr(0x880c, 0x5500)            # disable watchdog (reads back 0 = off)
-    for spr, m, v in INIT_UPD: a.updspr(spr, m, v)
-    for spr, v in INIT_WR: a.wrspr(spr, v)
-    a.lwz(17, 16, 0)                   # r17 = flash_offset
-    a.lwz(18, 16, 4)                   # r18 = length
-    a.lwz(20, 16, 8)                   # r20 = dest
-
-    def send(setup):
-        setup()                        # leave the byte in r3
-        a.addi(4, 0, 0); a.jall('byte'); a.nop()
-        a.sfnei(8, 0); a.bf('fail'); a.nop()
-
-    # JEDEC-ID probe (0x9f -> 3 bytes) into param+16..18: confirms SPI works at all.
-    a.updspr(SPR9000, 0x4000, 0)       # CS assert
-    send(lambda: a.addi(3, 0, 0x9f))
-    for off in (16, 17, 18):
-        a.addi(3, 0, 0xff); a.addi(4, 0, 0x80); a.jall('byte'); a.nop()
-        a.sfnei(8, 0); a.bf('fail'); a.nop()
-        a.sb(16, off, 11)              # param[off] = jedec byte
-    a.updspr(SPR9000, 0x4000, 0x4000)  # CS deassert
-
-    # main READ: CS assert, 0x03 + 3 address bytes (MSB first), data, CS deassert
-    a.updspr(SPR9000, 0x4000, 0)       # CS assert (clear bit 0x4000)
-    send(lambda: a.addi(3, 0, 0x03))
-    send(lambda: (a.srli(3, 17, 16), a.andi(3, 3, 0xff)))
-    send(lambda: (a.srli(3, 17, 8), a.andi(3, 3, 0xff)))
-    send(lambda: (a.ori(3, 17, 0), a.andi(3, 3, 0xff)))
-    a.addi(19, 0, 0)                   # i = 0
-    a.label('loop')
-    a.sfgeu(19, 18); a.bf('rdone'); a.nop()        # i >= length -> done
-    a.addi(3, 0, 0xff); a.addi(4, 0, 0x80); a.jall('byte'); a.nop()   # recv a byte
-    a.sfnei(8, 0); a.bf('fail'); a.nop()
-    a.add(6, 20, 19); a.sb(6, 0, 11)               # dest[i] = RX
-    a.addi(19, 19, 1); a.j('loop'); a.nop()
-    a.label('rdone')
-    a.updspr(SPR9000, 0x4000, 0x4000)              # CS deassert
-    a.const(4, 0x0000600D); a.sw(16, 12, 4)        # status = ok
-    a.jall('restore'); a.nop()                     # put every touched SPR back so USB/reads stay pristine
-    a.jr(14); a.nop()
-    a.label('fail')
-    a.updspr(SPR9000, 0x4000, 0x4000)              # release the bus
-    a.const(3, 0xBAD00000); a.or_(3, 3, 8); a.sw(16, 12, 3)   # status = 0xBAD0000 | errcode
-    a.jall('restore'); a.nop()
-    a.jr(14); a.nop()
-    # --- restore(): write the saved original values back to every SPR we modified ---
-    a.label('restore')
-    for i, spr in enumerate(SAVED_SPRS):
-        a.lwz(5, 15, i * 4); a.mtspr(0, 5, spr)    # r15 = save area; SPR = saved[i]
-    a.jr(9); a.nop()
-    # --- byte(r3=value, r4=recv-bits 0 or 0x80) -> r11=RX, r8=0 ok / 2 timeout ---
-    a.label('byte')
-    a.mfspr(5, 0, SPR9000); a.const(2, 0xFFFFFF7F); a.and_(5, 5, 2); a.or_(5, 5, 4); a.mtspr(0, 5, SPR9000)
-    a.mtspr(0, 3, 0x9250)              # TX value
-    a.addi(6, 0, 1); a.mtspr(0, 6, 0x9244)         # start
-    a.const(7, 0x00080000)            # bounded timeout (returns rather than hangs)
-    a.label('poll')
-    a.mfspr(2, 0, 0x880c); a.sfeqi(2, 0); a.bf('nofeed'); a.nop()   # feed watchdog so a wait can't reset us
-    a.const(2, 0x0005001d); a.mtspr(0, 2, 0x880c)
-    a.label('nofeed')
-    a.mfspr(5, 0, 0x9248); a.andi(5, 5, 1); a.sfnei(5, 0); a.bf('bgot'); a.nop()
-    a.addi(7, 7, -1); a.sfeqi(7, 0); a.bf('btmo'); a.nop()
-    a.j('poll'); a.nop()
-    a.label('bgot')
-    a.mfspr(11, 0, 0x9250); a.addi(8, 0, 0); a.jr(9); a.nop()
-    a.label('btmo')
-    a.addi(8, 0, 2); a.jr(9); a.nop()
-    return a.finish()
-
-
 if __name__ == '__main__':
     import subprocess
-    for name, blob in (('marker', marker()), ('reader', reader()),
-                       ('diag_core', diag(0x11)), ('diag_periph', diag(0x9000))):
-        path = f'/private/tmp/claude-501/-Users-tbelbek--claude-spares-spare-ifmGrF/3f8797bd-678d-4de2-97be-a71b1a559292/scratchpad/re/stub_{name}.bin'
+    out_dir = os.path.dirname(os.path.abspath(__file__))            # write beside this script (tools/)
+    for name, blob in (('marker', marker()),):
+        path = os.path.join(out_dir, f'stub_{name}.bin')
         open(path, 'wb').write(blob)
         print(f'=== {name}: {len(blob)} bytes ===')
         # self-verify by disassembling

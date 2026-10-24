@@ -132,7 +132,7 @@ erase→program→readback changes exactly the two patched bytes.
 ```
 device/
   kdc_dump.py   loader entry + USB/BootROM fingerprinting + 0xCB memory read/write
-  kdc_run.py    flasher | dump | flashpatch | flashrestore | silence-sounds | reader | marker | diag | bootrom
+  kdc_run.py    flasher | dump | flashpatch | flashrestore | silence-sounds | patch | jpeg-quality | stockread | marker | bootrom
 tools/
   flstub.py     the payload: LE hand-port of flasher.c (cmd 0/1/2/3) -> in-memory blob,
                 build(window=(lo,hi)) hard-restricts erase/program to that window
@@ -140,9 +140,9 @@ tools/
   flsim.py      offline validator: CPU+SPI+flash model; runs the full write flow, the bounds
                 guards, and fault injection. Runs on a synthetic image with no dump present.
   or1k_dis.py   minimal little-endian OpenRISC (ORBIS32) disassembler
-  stub_build.py the Asm (LE OpenRISC assembler) + marker/reader/diag probe payloads
+  stub_build.py the Asm (LE OpenRISC assembler) + the marker probe payload
   spi_trace.py  / spi_frame.py   emulate the ROM SPI-read path (CS framing, TX opcode log)
-  stub_*.bin    small probe payloads (marker: zero-SPI launch test; reader/diag: experiments)
+  stub_marker.bin  small zero-SPI launch/return probe payload
 ```
 
 ## Running (macOS)

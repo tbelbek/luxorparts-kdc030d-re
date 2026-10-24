@@ -2,7 +2,6 @@
 """Run an SRAM payload in the camera's BootROM loader via the loader's own 0xCB.
 
   marker  : upload stub_marker.bin (zero SPI), launch, verify it wrote 0xCAFE and returned.
-  reader  : upload stub_reader.bin, read ONE flash sector at a given offset into SRAM, twice.
 
 0xCB forms (all function=0x00102620, the ROM memory helper):
   read   : callback=0xFFFFFFFF, data-in           (proven: we read the BootROM this way)
@@ -66,19 +65,6 @@ def enter_loader():
     return bot
 
 
-def verify_bootrom(bot):
-    # The reader executes ROM code at these sites; require them to match ONE reference
-    # exactly (head[:16] is identical across refs, so pick by the actual callee bytes).
-    SITES = ((0x485c, 0x4898), (0x1018, 0x1064), (0x2530, 0x2584), (0x2620, 0x265C))
-    ours = {(lo, hi): bot.rom_read(0x00100000 + lo, hi - lo) for lo, hi in SITES}
-    for p in K.ROM_REFS:
-        r = p.read_bytes()
-        if all(ours[(lo, hi)] == r[lo:hi] for lo, hi in SITES):
-            print(f'BootROM reader-callees match reference {p.name}')
-            return
-    sys.exit('BootROM reader-callee code matches NO reference; stop (analysis may not apply)')
-
-
 def marker():
     bot = enter_loader()
     stub = (HERE.parent / 'tools' / 'stub_marker.bin').read_bytes()
@@ -91,41 +77,6 @@ def marker():
     res = bot.rom_read(PARAM + 12, 4)
     ok = res == struct.pack('<I', 0x0000CAFE)
     print(f'marker result [0x{PARAM+12:x}] = {res.hex()}  {"OK — launch+return works" if ok else "MISMATCH"}')
-    bot.release()
-    print('power-cycle the camera to return to stock')
-
-
-def reader(offset, length):
-    assert length <= 480 and offset >= 0
-    bot = enter_loader()
-    verify_bootrom(bot)
-    stub = (HERE.parent / 'tools' / 'stub_reader.bin').read_bytes()
-    sram_write(bot, ENTRY, stub)
-    if bot.rom_read(ENTRY, len(stub)) != stub:
-        sys.exit('reader upload readback mismatch; stop')
-    # Put the data buffer INSIDE the param block (dest = PARAM+20) and read everything
-    # back from launch()'s single response — the 0xCB handler returns `resp` bytes from
-    # PARAM after the stub runs, so status+jedec+data come in ONE transaction. Avoids a
-    # second 0xCB read, which fails after the stub has driven SPI.
-    # The stub restores all SPRs before returning, so the device is pristine and SEPARATE
-    # 0xCB reads of our SRAM result work (as the marker proved). 30s launch lets it finish.
-    DEST = 0x3000
-    def one():
-        sram_write(bot, PARAM, struct.pack('<IIII', offset, length, DEST, 0))
-        launch(bot, ENTRY, PARAM)
-        print('  stub returned (launch ok)')
-        status = struct.unpack('<I', bot.rom_read(PARAM + 12, 4))[0]
-        jedec = bot.rom_read(PARAM + 16, 3)
-        print(f'  status 0x{status:08x}  JEDEC {jedec.hex()} (expect 5e4016)')
-        if status != 0x600D:
-            print('  reader error (status != 0x600d); not a brick — power-cycle returns to stock')
-            return None
-        return bot.rom_read(DEST, length)
-    a = one()
-    if a is None:
-        print('read did not complete; see status/JEDEC above')
-    else:
-        print(f'flash@0x{offset:x} [{length}B]:\n{a.hex()}')
     bot.release()
     print('power-cycle the camera to return to stock')
 
@@ -534,25 +485,6 @@ def flashrestore(backup_path, confirm):
     bot.release()
 
 
-def diag(which):
-    # Diagnostic ladder: does reading an SPR in the loader fault? Upload a minimal stub that
-    # reads one SPR and returns; retrieve stage+value via SEPARATE reads (marker-proven path).
-    stub = (HERE.parent / 'tools' / f'stub_diag_{which}.bin').read_bytes()
-    bot = enter_loader()
-    sram_write(bot, ENTRY, stub)
-    if bot.rom_read(ENTRY, len(stub)) != stub:
-        sys.exit('diag stub upload readback mismatch; stop')
-    sram_write(bot, PARAM, b'\0' * 24)
-    launch(bot, ENTRY, PARAM)
-    print(f'  diag_{which}: stub returned (launch ok)')
-    stage = struct.unpack('<I', bot.rom_read(PARAM + 12, 4))[0]
-    value = struct.unpack('<I', bot.rom_read(PARAM + 16, 4))[0]
-    done = 'DONE (SPR read did NOT fault)' if stage == 0x0000D04E else f'stopped at stage 0x{stage:08x}'
-    print(f'  stage: 0x{stage:08x} -> {done}')
-    print(f'  SPR value read: 0x{value:08x}')
-    bot.release()
-
-
 def stockread(address, length):
     # NON-SPI path: in STOCK mode (DRAM up, no loader), the stock firmware's 0xCD vendor
     # command does a pure device-to-host memory read when callback=0xFFFFFFFF (it sends
@@ -619,8 +551,6 @@ if __name__ == '__main__':
         q = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 90
         cf = 'WRITE' if 'WRITE' in sys.argv[3:] else 'DRY'
         jpeg_quality(bpath, q, cf)
-    elif len(sys.argv) >= 2 and sys.argv[1] == 'diag':
-        diag(sys.argv[2] if len(sys.argv) > 2 else 'core')
     elif len(sys.argv) >= 2 and sys.argv[1] == 'stockread':
         stockread(int(sys.argv[2], 0) if len(sys.argv) > 2 else 0x02000000,
                   int(sys.argv[3], 0) if len(sys.argv) > 3 else 16)
@@ -628,9 +558,6 @@ if __name__ == '__main__':
         bootrom(sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'our_bootrom.bin'))
     elif len(sys.argv) >= 2 and sys.argv[1] == 'marker':
         marker()
-    elif len(sys.argv) >= 2 and sys.argv[1] == 'reader':
-        off = int(sys.argv[2], 0) if len(sys.argv) > 2 else 0
-        n = int(sys.argv[3], 0) if len(sys.argv) > 3 else 256
-        reader(off, n)
     else:
-        sys.exit('usage: kdc_run.py stockread [addr] [len] | marker | reader [offset] [length] | bootrom')
+        sys.exit('usage: kdc_run.py dump START LEN [out] | flasher [addr] [len] | flashpatch | '
+                 'flashrestore | silence-sounds | patch | jpeg-quality | stockread | bootrom | marker')
