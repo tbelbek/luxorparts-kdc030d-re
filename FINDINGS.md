@@ -33,27 +33,33 @@ Detailed reverse-engineering notes behind the tooling. The README is the how-to;
   above. The other ~53 are boot / SD / display / audio settle times (off the photo path) — necessary
   hardware timing, NOT safe to shorten.
 
-## Robustness guards (Task 5) — PROVEN unnecessary (no safe guard adds value)
-- **The feared settle underflow is benign — it cannot hang.** The settle computes `delay(deadline - now)`;
-  if `now` has passed the deadline (the narrow re-sample race at 0x02007b5c–70, already partly guarded by
-  the skip-branch at 0x02007b54), the argument underflows to a huge unsigned value ~0xFFFFFFxx. But trace
-  `delay(ms)` (0x0201f12c): `target = start + ms` (mod 2^32), then `while sfltu(TICKS, target)`. A huge ms
-  WRAPS `target` to just below `start`, so `TICKS < target` is immediately false and **delay returns at
-  once** — not a 49-day hang, not even a stall. In the normal path `deadline - now` is always ≤ the 250-tick
-  settle, so the delay is already bounded. There is therefore **nothing to clamp**: the only non-bounded
-  input self-corrects to an instant return. Verified against the delay() disassembly.
-  (An in-place "force the fast path" patch at 0x02007b68 was considered and REJECTED: it would always wait a
-  fixed 250 ticks instead of the computed remainder, regressing the very shutter lag we reduced.)
+## Robustness guards (Task 5) — benign in THIS path; no safe guard adds value (checked with Codex)
+- The settle computes `delay(deadline - now)`. It is reached only past the skip-branch at 0x02007b54, so the
+  underflow can only come from the ~4-instruction re-sample race (0x02007b5c–70) where `now` crosses the
+  deadline — i.e. by a *few* ticks. So the argument is a SMALL negative, `0xFFFFFFF_` (≈ −1…−10), not an
+  arbitrary huge value. In `delay(ms)` (0x0201f12c): `target = start + ms` with `start = uptime()` (a large
+  running ms counter), so `target = start − (few)` which is still < `start`; `while sfltu(TICKS, target)` is
+  immediately false and **delay returns at once**. The normal (non-race) `deadline − now` is ≤ the 250-tick
+  settle, already bounded. So in the capture path there is nothing to clamp.
+- **Codex caveat (correct):** this is NOT a general proof that `delay()` is underflow-safe. A *different*
+  caller passing e.g. `ms = 0xFFFFFFFE` with a tiny `start` would make `target` land near the top of the
+  counter and wait a long time. No such caller exists here (every `delay()` argument is a small constant or
+  the bounded settle remainder), so a guard adds no value on THIS firmware — but the general delay() has no
+  internal clamp. A real clamp would need injected code, for which this packed image has no safe home.
+  (An in-place "force the fast path" at 0x02007b68 was REJECTED: it would wait a fixed 250 ticks instead of
+  the computed remainder, regressing the shutter lag we reduced.)
 - **Non-wrap-safe timestamps** (0x020079e4, 0x02007ae0, 0x02007b50): absolute unsigned `uptime()` compares
   misbehave only at the ~49.7-day 32-bit-ms rollover — irrelevant for a battery camera that is power-cycled.
 - **No explicit AE/exposure-valid gate** before the grab — capture is purely time-gated (worked at 250 ms).
 
 ## Shipped debug code (Task 4) — inert; one dangerous "knob" withdrawn
 - 45 `BACK_JPCON1=%X`-style debug format strings (flash 0x6d3f4+) feed a JP-register printf dump at
-  0x02030d3c–0x020311b0. That dump is **unreachable dead code**: nothing calls, branches to, or stores a
-  pointer to 0x02030d3c, so it never runs — zero runtime cost, nothing to safely remove (the space is in a
-  packed code sector and cannot host anything executable). The 4 other scattered BACK_JP refs have no direct
-  caller either.
+  0x02030d3c–0x020311b0. A static search finds **no reference to it**: no `l.jal`/`l.j`/`l.bf`/`l.bnf`
+  targets 0x02030d3c, it is not stored as an LE pointer, and no `movhi`+`ori` builds its address — so it is
+  very likely leftover debug that never runs. **Codex caveat (correct):** a static one-level search cannot
+  PROVE unreachability (an indirect `l.jalr` through a computed/table pointer could still reach it), so this
+  is "no references found," not a proof of dead code. Either way there is nothing worth or safe to remove on
+  this packed image, and the prints (to a serial debug sink) are invisible on a production unit.
 - CORRECTION: an earlier `docs/KNOBS.md` draft offered a NOP of `0x37414` as "the debug-dump call". WRONG —
   0x37414 calls 0x02030c48, which **programs JPEG hardware SPRs 0xb18c–0xb1b0 from a config struct** (mtspr,
   not a printf). NOPing it would corrupt JPEG. The knob has been removed; do not patch 0x37414.

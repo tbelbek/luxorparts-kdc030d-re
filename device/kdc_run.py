@@ -353,11 +353,13 @@ def _find_wavs(data):
     return out
 
 
-def flash_edits(backup, edits, confirm, strict=True):
+def flash_edits(backup, edits, confirm, strict=True, managed=None):
     # edits: {flash_offset: new_byte}. Rewrite each affected 4KB sector to backup+edits.
     # strict: require the live sector to still match the backup (or already be the target) before writing.
-    # Non-strict (e.g. re-patching over a prior change) trusts backup+edits as authoritative and relies on
-    # the granule preflight + readback verify for safety.
+    #   `managed` (a set of flash offsets this patch owns) relaxes that ONLY for re-patching our own bytes:
+    #   if the live sector differs from backup but every differing byte is within `managed`, the write is
+    #   allowed (e.g. retuning a prior awb/print-tone run); any difference OUTSIDE `managed` still refuses.
+    # Non-strict trusts backup+edits as authoritative (e.g. silence-sounds re-patching a header change).
     assert edits
     sectors = sorted(set(off & ~0xfff for off in edits))
     targets = {}
@@ -379,7 +381,11 @@ def flash_edits(backup, edits, confirm, strict=True):
             print(f'  sector 0x{sec:x}: already matches target — will skip'); continue
         if strict and live != backup[sec:sec + 0x1000]:
             bad = [sec + k for k in range(0x1000) if live[k] != backup[sec + k]]
-            bot.release(); sys.exit(f'live sector 0x{sec:x} differs from backup at {len(bad)} bytes {bad[:4]} and is not the target; refusing')
+            outside = [b for b in bad if managed is None or b not in managed]
+            if outside:
+                bot.release(); sys.exit(f'live sector 0x{sec:x} differs from backup at {len(bad)} bytes {bad[:4]} '
+                                        f'({len(outside)} OUTSIDE the managed set, e.g. {outside[:4]}); refusing')
+            print(f'  sector 0x{sec:x}: live differs from backup only in {len(bad)} managed byte(s) (prior patch) — re-patching')
         nchg = sum(1 for k in range(0x1000) if live[k] != targets[sec][k])
         todo.append(sec)
         tag = 'matches backup' if live == backup[sec:sec + 0x1000] else 'differs from backup (non-strict)'
@@ -440,15 +446,16 @@ def print_tone(backup_path, threshold, confirm):
     if not (1 <= threshold <= 254):
         sys.exit('print-tone: threshold must be 1..254 (higher = darker)')
     backup = open(backup_path, 'rb').read()
-    if len(backup) < PRINT_THRESH_OFF + 4:
-        sys.exit('print-tone: backup too short')
+    if len(backup) < (PRINT_THRESH_OFF & ~0xfff) + 0x1000:   # need the whole sector present to rewrite it
+        sys.exit('print-tone: backup too short (need the full 0x4d000 sector)')
     w = struct.unpack_from('<I', backup, PRINT_THRESH_OFF)[0]
     if w != 0xbc460080:              # l.sfgtui r6,128 — refuse on any other image
         sys.exit(f'print-tone: site @0x{PRINT_THRESH_OFF:x} word {w:08x} != expected bc460080; refusing')
     edits = {PRINT_THRESH_OFF: threshold & 0xff, PRINT_THRESH_OFF + 1: (threshold >> 8) & 0xff}
     print(f'print tone: fixed-mode threshold 128 -> {threshold} (0x{threshold:02x}); higher = darker.')
-    print(f'  pixel <= threshold prints black. Revert/retune: re-run, or flashrestore BACKUP 0x4d000 WRITE.')
-    flash_edits(backup, edits, confirm, strict=False)   # re-tunable: target is deterministic from the clean backup
+    print(f'  pixel <= threshold prints black (assumes head bit 0x8000 = energized/black — confirm on 1st print).')
+    print(f'  retune by re-running; full revert: flashrestore BACKUP 0x4d000 WRITE.')
+    flash_edits(backup, edits, confirm, strict=True, managed=set(edits.keys()))   # re-tunable; only our 2 bytes may differ
 
 
 def patch_bytes(backup_path, spec, confirm):
@@ -525,10 +532,11 @@ def awb(backup_path, rgain, bgain, confirm):
     print('  operand-patch recovery tier as the shutter patch, reversible; NOT a code/hook injection):')
     print('  page1 0x32=0x05 (auto-AWB OFF) -> page2 0x26(R)=0x%02x 0x27(B)=0x%02x -> restore page 1' % (rgain, bgain))
     print('  0x80=1.0x gain; lower R / higher B cools the warm cast.')
-    print(f'  retune: re-run with new R/B (it rewrites the sector from this clean backup each time).')
+    print(f'  retune: re-run with new R/B (rewrites from this clean backup; only our own bytes may differ live).')
     print(f'  {len(edits)} immediate bytes in sector 0x{AWB_SECTOR:x}. Full revert: flashrestore BACKUP 0x{AWB_SECTOR:x} WRITE')
-    flash_edits(backup, edits, confirm, strict=False)    # non-strict: target is deterministic from the clean
-                                                         # backup, so a prior awb run can be re-patched/retuned
+    # strict + managed: a prior awb run (our own bytes) is allowed to be re-patched, but any OTHER unexpected
+    # change in the sector still refuses — so retune works without blindly overwriting a tampered sector.
+    flash_edits(backup, edits, confirm, strict=True, managed=set(edits.keys()))
 
 
 def silence_sounds(backup_path, confirm):

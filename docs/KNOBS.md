@@ -29,10 +29,11 @@ is 1-bit harsh or has grey shading).
 
 ## Shipped debug code — nothing to remove (and do NOT NOP 0x37414)
 The firmware carries 45 `BACK_JPCON1=%X`-style debug format strings (flash 0x6d3f4+) and a function that
-printf's the JP registers (0x02030d3c–0x020311b0). That dump function is **unreachable dead code** — no
-call, branch, or stored pointer targets it, so it never executes and costs nothing at runtime; there is no
+printf's the JP registers (0x02030d3c–0x020311b0). A static search finds **no reference** to that function
+(no call/branch/pointer/address-build), so it is very likely leftover debug that never runs — though a
+static search can't fully prove unreachability (an indirect call could evade it). Either way there is no
 safe, worthwhile patch to "remove" it (you cannot reclaim the space for anything executable on this packed
-image). An earlier draft of this file told you to NOP `0x37414` as "the debug dump call" — that was WRONG:
+image), and the prints go to a serial sink that is invisible on a production unit. An earlier draft of this file told you to NOP `0x37414` as "the debug dump call" — that was WRONG:
 0x37414 calls 0x02030c48, which **writes JPEG hardware SPRs (0xb18c–0xb1b0) from a config struct**. NOPing
 it would drop essential codec configuration and corrupt JPEG. Do not patch it. (Details in FINDINGS.md.)
 
