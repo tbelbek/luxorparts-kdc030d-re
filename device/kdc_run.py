@@ -404,11 +404,17 @@ def flash_edits(backup, edits, confirm, strict=True, managed=None):
     _granule_preflight(bot)
     for sec in todo:
         cmd = _upload_payload(bot, (sec, sec + 0x1000))
-        # Re-read right before erase: skip if already the target. The strict/managed gate above validated the
-        # same sector moments earlier; nothing else writes flash while we hold the loader (single exclusive
-        # host session), so the sector cannot have changed between the two reads.
-        if _read_range(cmd, sec, 0x1000) == targets[sec]:
+        # Re-read immediately before erasing and RE-RUN the strict/managed gate on THIS read, so the guard
+        # protects the exact bytes about to be overwritten (the preflight above writes flash too, so "nothing
+        # changed since the first read" is not something to assume — re-validate here).
+        current = _read_range(cmd, sec, 0x1000)
+        if current == targets[sec]:
             print(f'  sector 0x{sec:x} already patched — skip'); continue
+        if strict:
+            outside = unmanaged_diffs(current, backup[sec:sec + 0x1000], managed, sec)
+            if outside:
+                bot.release(); sys.exit(f'sector 0x{sec:x} differs from backup OUTSIDE the managed set at erase '
+                                        f'time ({len(outside)} byte(s), e.g. {[hex(x) for x in outside[:4]]}); aborting')
         print(f'  *** WRITING sector 0x{sec:x} ***')
         _write_sector(cmd, sec, targets[sec])
     print('  DONE. Power-cycle the camera and test.')

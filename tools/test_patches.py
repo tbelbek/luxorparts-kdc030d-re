@@ -134,6 +134,54 @@ def test_managed_guard_real():
     print('  [ok] unmanaged_diffs (shipped guard): clean / own-bytes re-patch / foreign-byte block')
 
 
+def test_flash_edits_integration():
+    # Drive the REAL flash_edits() offline with fakes. Inject an UNMANAGED change at the pre-erase read and
+    # assert it aborts (SystemExit) and never calls _write_sector — i.e. the guard protects the bytes about
+    # to be overwritten, not just the first read.
+    sec = R.SECTOR
+    backup = bytearray(0x10000)                      # clean, all 0x00
+    edits = {sec + 5: 0xAA}; managed = set(edits.keys())
+    gate_sec = bytes(backup[sec:sec + 0x1000])       # gate read: clean (== backup)
+    tampered = bytearray(gate_sec); tampered[10] = 0x99   # pre-erase read: an unmanaged byte changed
+    reads = iter([gate_sec, bytes(tampered)])
+    writes = []
+    orig = (R.enter_loader, R._upload_payload, R._read_range, R._granule_preflight, R._write_sector)
+    R.enter_loader = lambda: type('B', (), {'release': lambda self: None})()
+    R._upload_payload = lambda bot, window: (lambda *a, **k: (0, R.JEDEC))
+    R._read_range = lambda cmd, s, n: next(reads)
+    R._granule_preflight = lambda bot: None
+    R._write_sector = lambda cmd, s, data: writes.append(s)
+    try:
+        raised = False
+        try:
+            R.flash_edits(bytes(backup), edits, 'WRITE', strict=True, managed=managed)
+        except SystemExit:
+            raised = True
+    finally:
+        R.enter_loader, R._upload_payload, R._read_range, R._granule_preflight, R._write_sector = orig
+    assert raised, 'flash_edits did not abort on an unmanaged change at erase time'
+    assert writes == [], f'_write_sector ran despite the abort: {writes}'
+    print('  [ok] flash_edits integration: unmanaged change at erase time -> abort, nothing written')
+
+
+def test_wrappers_pass_managed():
+    global skipped
+    if d is None:
+        skipped += 1; print('  [skip] wrapper strict/managed capture (no KDC_DUMP)'); return
+    cap = {}
+    orig = R.flash_edits
+    R.flash_edits = lambda backup, edits, confirm, strict=True, managed=None: cap.update(
+        strict=strict, managed=managed, keys=set(edits.keys()))
+    try:
+        R.awb(dump_path, 0x88, 0xd0, 'DRY')
+        assert cap['strict'] is True and cap['managed'] == cap['keys'] == set(R.awb_edits(0x88, 0xd0).keys())
+        R.print_tone(dump_path, 0x90, 'DRY')
+        assert cap['strict'] is True and cap['managed'] == cap['keys'] == set(R.print_tone_edits(0x90).keys())
+    finally:
+        R.flash_edits = orig
+    print('  [ok] awb()/print_tone() call flash_edits with strict=True and managed=set(edits.keys())')
+
+
 if __name__ == '__main__':
     print(f'patch logic tests ({"real dump" if d else "NO KDC_DUMP — dump checks will be skipped"}):')
     test_constants()
@@ -142,6 +190,8 @@ if __name__ == '__main__':
     test_print_tone_real()
     test_jpeg_quality()
     test_managed_guard_real()
+    test_flash_edits_integration()
+    test_wrappers_pass_managed()
     if skipped:
         print(f'  PASSED (constants/builder checks) — {skipped} dump-dependent group(s) SKIPPED (set KDC_DUMP for full)')
     else:
