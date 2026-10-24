@@ -94,6 +94,17 @@ sudo python3 device/kdc_run.py flashrestore YOUR-4MB-DUMP.bin WRITE
 `250` is the new tick value (≈ 250 ms settle). Re-run with a different number to tune; the
 reflash is cheap, off the boot path, and recoverable.
 
+Two more patch modes share the same safe write path (dry-run unless the final arg is `WRITE`):
+
+```bash
+# silence the power-on/off jingles (zeros the two longest WAVs' PCM samples; headers + other sounds kept):
+sudo python3 device/kdc_run.py silence-sounds YOUR-4MB-DUMP.bin WRITE
+```
+
+`tools/xref.py` builds a call-graph from an `or1k_dis.py` listing (`callers`/`calls`/`trace`/`func`)
+so you can see "where is what called" — standard decompilers mis-model this SoC's call/branch slots,
+so this works off the correct listing instead.
+
 Safety model, in order:
 - **Full 4 MiB backup first** (`dump 0 0x400000`), then every write verifies against it.
 - **Erase-granule preflight** (committed writes only): in blank flash at `0x200000`, program a
@@ -121,10 +132,11 @@ erase→program→readback changes exactly the two patched bytes.
 ```
 device/
   kdc_dump.py   loader entry + USB/BootROM fingerprinting + 0xCB memory read/write
-  kdc_run.py    flasher | dump | flashpatch | flashrestore | reader | marker | diag | bootrom
+  kdc_run.py    flasher | dump | flashpatch | flashrestore | silence-sounds | reader | marker | diag | bootrom
 tools/
   flstub.py     the payload: LE hand-port of flasher.c (cmd 0/1/2/3) -> in-memory blob,
                 build(window=(lo,hi)) hard-restricts erase/program to that window
+  xref.py       call-graph / cross-reference index over an or1k_dis.py listing (who-calls-what)
   flsim.py      offline validator: CPU+SPI+flash model; runs the full write flow, the bounds
                 guards, and fault injection. Runs on a synthetic image with no dump present.
   or1k_dis.py   minimal little-endian OpenRISC (ORBIS32) disassembler

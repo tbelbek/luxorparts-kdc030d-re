@@ -170,7 +170,8 @@ PATCH = {0x9f48: 0xc8, 0x9f49: 0x00}   # 1000 -> 200 ticks
 
 
 def main():
-    if BACKUP and os.path.exists(BACKUP):
+    if BACKUP:
+        if not os.path.exists(BACKUP): sys.exit(f'KDC_DUMP set but not found: {BACKUP} (unset it to use the synthetic image)')
         backup = open(BACKUP, 'rb').read(); print(f'using real dump: {BACKUP}')
     else:
         # synthetic 64 KiB test image: blank except a deterministic sector 0x9000 carrying the real

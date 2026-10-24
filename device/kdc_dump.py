@@ -19,8 +19,11 @@ from pathlib import Path
 import usb.core, usb.util, usb.backend.libusb1
 
 import os
-BACKEND = usb.backend.libusb1.get_backend(
-    find_library=lambda _: os.environ.get('KDC_LIBUSB', '/opt/homebrew/lib/libusb-1.0.dylib'))
+# Default: let libusb discover the library the normal way; only override when KDC_LIBUSB is set
+# (e.g. Homebrew on Apple Silicon: KDC_LIBUSB=/opt/homebrew/lib/libusb-1.0.dylib).
+_LIBUSB = os.environ.get('KDC_LIBUSB')
+BACKEND = (usb.backend.libusb1.get_backend(find_library=lambda _: _LIBUSB)
+           if _LIBUSB else usb.backend.libusb1.get_backend())
 STOCK_IDS = ((0x0219, 0x3280), (0x1908, 0x3283))
 LOADER_ID = (0x1908, 0x3319)
 ROM_FN = 0x00102620                      # BootROM 0xCB memory helper, same address in both known ROMs

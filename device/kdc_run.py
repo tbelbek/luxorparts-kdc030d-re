@@ -192,18 +192,25 @@ def dumpflash(start, total, outpath):
         return status, (bot.rom_read(REQ + 28, n) if n else b'')
     st, jd = cmd(0, 0, 3)
     print(f'  cmd0 init+JEDEC: status 0x{st:x} JEDEC {jd.hex()}')
-    out = bytearray(); off = start
+    if st != 0 or jd != bytes([0x5e, 0x40, 0x16]):
+        bot.release(); sys.exit(f'cmd0 init/JEDEC failed (status 0x{st:x}, jedec {jd.hex()}); aborting dump')
+    out = bytearray(); off = start; failed = False
     while off < start + total:
         n = min(480, start + total - off)
         st, d = cmd(1, off, n)
         if st != 0 or len(d) != n:
-            print(f'  stop at 0x{off:x}: status 0x{st:x} len {len(d)}'); break
+            print(f'  stop at 0x{off:x}: status 0x{st:x} len {len(d)}'); failed = True; break
         out += d; off += n
         if (off - start) % 0x1000 == 0:
             print(f'  {off - start:#x}/{total:#x}', flush=True)
+    bot.release()
+    if failed:
+        part = outpath + '.partial'
+        Path(part).write_bytes(out)
+        sys.exit(f'DUMP INCOMPLETE: only {len(out)}/{total} bytes read; saved partial to {part} (NOT {outpath}). '
+                 f'Re-run; do not use this as a backup.')
     Path(outpath).write_bytes(out)
     print(f'saved {len(out)} bytes of flash 0x{start:x}.. to {outpath}')
-    bot.release()
 
 
 MAGIC = 0x52585041
@@ -316,14 +323,15 @@ def _granule_preflight(bot):
 
 
 def _build_patched(backup, ticks):
-    assert 0 <= ticks <= 0xffff, 'ticks must fit the addi immediate (0..65535)'
+    assert 1 <= ticks <= 32767, 'ticks must be 1..32767 (a positive l.addi immediate; >32767 would be negative)'
     cur = struct.unpack_from('<I', backup, PATCH_OFF)[0]
     if (cur >> 16) != 0x9e58:
         sys.exit(f'backup word @0x{PATCH_OFF:x} is 0x{cur:08x}, not l.addi r18,r24,imm (0x9e58xxxx); refusing')
     patched = bytearray(backup[SECTOR:SECTOR + 0x1000])
     struct.pack_into('<I', patched, PATCH_OFF - SECTOR, 0x9e580000 | ticks)
     diff = [SECTOR + i for i in range(0x1000) if patched[i] != backup[SECTOR + i]]
-    assert diff == [0x9f48, 0x9f49], f'unexpected diff {diff}; refusing'
+    # the change must stay within the two immediate bytes (a value like 1000->1001 changes only one)
+    assert set(diff) <= {0x9f48, 0x9f49}, f'unexpected diff {diff}; refusing'
     return bytes(patched), cur
 
 
@@ -364,6 +372,89 @@ def flashpatch(backup_path, ticks, confirm):
     print('  VERIFY OK: sector matches patched image; only 0x9f48,0x9f49 changed vs backup.')
     print('  DONE. Power-cycle the camera and test the shutter.')
     bot.release()
+
+
+def _find_wavs(data):
+    # locate every RIFF/WAVE and its data-chunk size field: returns [(start, data_size_field_off, data_size)]
+    out = []; i = 0
+    while True:
+        s = data.find(b'RIFF', i)
+        if s < 0: break
+        i = s + 1
+        if data[s + 8:s + 12] != b'WAVE': continue
+        riffsz = struct.unpack_from('<I', data, s + 4)[0]; p = s + 12
+        while p + 8 <= min(len(data), s + 12 + riffsz):
+            cid = data[p:p + 4]; csz = struct.unpack_from('<I', data, p + 4)[0]
+            if cid == b'data':
+                out.append((s, p + 4, csz)); break
+            p += 8 + csz + (csz & 1)
+    return out
+
+
+def flash_edits(backup, edits, confirm, strict=True):
+    # edits: {flash_offset: new_byte}. Rewrite each affected 4KB sector to backup+edits.
+    # strict: require the live sector to still match the backup (or already be the target) before writing.
+    # Non-strict (e.g. re-patching over a prior change) trusts backup+edits as authoritative and relies on
+    # the granule preflight + readback verify for safety.
+    assert edits
+    sectors = sorted(set(off & ~0xfff for off in edits))
+    targets = {}
+    for sec in sectors:
+        patched = bytearray(backup[sec:sec + 0x1000])
+        for o, v in edits.items():
+            if sec <= o < sec + 0x1000: patched[o - sec] = v
+        targets[sec] = bytes(patched)
+    bot = enter_loader()
+    cmd = _upload_payload(bot, (sectors[0], sectors[0] + 0x1000))
+    st, jd = cmd(0, 0, 3)
+    print(f'  cmd0 init+JEDEC: status 0x{st:x} JEDEC {jd.hex()} (expect 5e4016)')
+    if st != 0 or jd != JEDEC: bot.release(); sys.exit('JEDEC probe failed; refusing')
+    todo = []
+    for sec in sectors:
+        cmd = _upload_payload(bot, (sec, sec + 0x1000))
+        live = _read_range(cmd, sec, 0x1000)
+        if live == targets[sec]:
+            print(f'  sector 0x{sec:x}: already matches target — will skip'); continue
+        if strict and live != backup[sec:sec + 0x1000]:
+            bad = [sec + k for k in range(0x1000) if live[k] != backup[sec + k]]
+            bot.release(); sys.exit(f'live sector 0x{sec:x} differs from backup at {len(bad)} bytes {bad[:4]} and is not the target; refusing')
+        nchg = sum(1 for k in range(0x1000) if live[k] != targets[sec][k])
+        todo.append(sec)
+        tag = 'matches backup' if live == backup[sec:sec + 0x1000] else 'differs from backup (non-strict)'
+        print(f'  sector 0x{sec:x}: {tag}; {nchg} byte(s) will change')
+    print(f'  total sectors to write: {len(todo)}')
+    if confirm != 'WRITE':
+        print('\nDRY RUN (nothing written — JEDEC + sector reads only). Re-run with final arg WRITE.'); bot.release(); return
+    print('\nerase-granule preflight (writes a blank scratch block, proves 0x20 = 4KB)...')
+    _granule_preflight(bot)
+    for sec in todo:
+        cmd = _upload_payload(bot, (sec, sec + 0x1000))
+        if _read_range(cmd, sec, 0x1000) == targets[sec]:
+            print(f'  sector 0x{sec:x} already patched — skip'); continue
+        print(f'  *** WRITING sector 0x{sec:x} ***')
+        _write_sector(cmd, sec, targets[sec])
+    print('  DONE. Power-cycle the camera and test.')
+    bot.release()
+
+
+def silence_sounds(backup_path, confirm):
+    # Silence the power-on/off jingles (the two longest WAVs) by zeroing their PCM SAMPLES to 0x00
+    # (= silence). The player ignores the WAV header length, so zeroing the samples themselves is the
+    # reliable kill; the format header (sample rate etc.) is preserved. ~110KB over ~28 sectors.
+    backup = open(backup_path, 'rb').read()
+    wavs = sorted(_find_wavs(backup), key=lambda w: -w[2])
+    if len(wavs) < 2: sys.exit('could not find two WAVs in the backup')
+    power = wavs[:2]
+    edits = {}
+    print('silencing the 2 longest WAVs (power on/off jingles) by zeroing their samples:')
+    for s, dszoff, dsz in power:
+        payload = dszoff + 4                          # samples start right after the data-size field
+        print(f'  WAV @0x{s:x}  samples 0x{payload:x}..0x{payload+dsz:x} ({dsz}B, ~{dsz/(16000*2):.2f}s) -> silence')
+        for o in range(payload, payload + dsz):
+            edits[o] = 0
+    secs = sorted(set(o & ~0xfff for o in edits))
+    print(f'  {len(edits)} sample bytes across {len(secs)} sectors (0x{secs[0]:x}..0x{secs[-1]:x}); headers kept')
+    flash_edits(backup, edits, confirm, strict=False)  # non-strict: re-patches over the earlier header change
 
 
 def flashrestore(backup_path, confirm):
@@ -459,6 +550,11 @@ if __name__ == '__main__':
         bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
         cf = sys.argv[3] if len(sys.argv) > 3 else 'DRY'
         flashrestore(bpath, cf)
+    elif len(sys.argv) >= 2 and sys.argv[1] == 'silence-sounds':
+        # silence-sounds BACKUP [WRITE]   (zero the 2 longest WAVs' size fields; dry run unless WRITE)
+        bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
+        cf = sys.argv[3] if len(sys.argv) > 3 else 'DRY'
+        silence_sounds(bpath, cf)
     elif len(sys.argv) >= 2 and sys.argv[1] == 'diag':
         diag(sys.argv[2] if len(sys.argv) > 2 else 'core')
     elif len(sys.argv) >= 2 and sys.argv[1] == 'stockread':

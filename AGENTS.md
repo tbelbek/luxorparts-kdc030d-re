@@ -64,6 +64,11 @@ user-facing story; this file is the working brief.
   flashed and verified on hardware (lag ~1 s → ~¼ s, exposure fine); tune via the tool.
 - Assets live at flash `0x7ea00..0x1ce000`: JPEG UI graphics, PCM (WAV) sounds, a bitmap font
   (no TTF/OTF), indexed by a `SFAT` table (header +0x304). Carve by signature from a dump.
+- Power-on/off jingles = the two longest WAVs (0x145c22, 0x15409a). The player ignores the WAV
+  header length, so zeroing the RIFF/data size does NOT silence them; zeroing the PCM SAMPLES does
+  (`silence-sounds` mode). Flashed + verified on hardware.
+- `tools/xref.py` gives who-calls-what over an or1k_dis listing; use it instead of Ghidra/radare2,
+  whose stock OpenRISC model mis-handles this SoC's no-delay-slot calls.
 
 ## Env / setup
 
