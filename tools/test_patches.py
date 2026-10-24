@@ -191,6 +191,36 @@ def test_flashpatch_guard():
     print('  [ok] flashpatch GUARD: delays->250 + l.sub r11->r24 (positive constant); ticks<6 refused; diff in MANAGED_GUARD')
 
 
+def test_flashpatch_erase_guard():
+    # Drive the REAL flashpatch() offline; the live sector is clean at the first gate but an UNMANAGED byte
+    # changes at the post-preflight re-read. flashpatch must abort (SystemExit) without calling _write_sector.
+    global skipped
+    if d is None:
+        skipped += 1; print('  [skip] flashpatch erase-time guard (no KDC_DUMP)'); return
+    sec = R.SECTOR
+    orig = d[sec:sec + 0x1000]
+    tampered = bytearray(orig); tampered[0x600] ^= 0xff          # a byte well outside the managed delay/guard set
+    reads = iter([bytes(orig), bytes(tampered)])                 # gate read (clean) ; post-preflight read (tampered)
+    writes = []
+    orig_fns = (R.enter_loader, R._upload_payload, R._read_range, R._granule_preflight, R._write_sector)
+    R.enter_loader = lambda: type('B', (), {'release': lambda self: None})()
+    R._upload_payload = lambda bot, window: (lambda *a, **k: (0, R.JEDEC))
+    R._read_range = lambda cmd, s, n: next(reads)
+    R._granule_preflight = lambda bot: None
+    R._write_sector = lambda cmd, s, data: writes.append(s)
+    try:
+        raised = False
+        try:
+            R.flashpatch(dump_path, 250, 'WRITE', guard=False)
+        except SystemExit:
+            raised = True
+    finally:
+        R.enter_loader, R._upload_payload, R._read_range, R._granule_preflight, R._write_sector = orig_fns
+    assert raised, 'flashpatch did not abort on an unmanaged change at erase time'
+    assert writes == [], f'_write_sector ran despite the abort: {writes}'
+    print('  [ok] flashpatch erase-time guard: unmanaged change after preflight -> abort, nothing written')
+
+
 def test_wrappers_pass_managed():
     global skipped
     if d is None:
@@ -219,6 +249,7 @@ if __name__ == '__main__':
     test_managed_guard_real()
     test_flash_edits_integration()
     test_flashpatch_guard()
+    test_flashpatch_erase_guard()
     test_wrappers_pass_managed()
     if skipped:
         print(f'  PASSED (constants/builder checks) — {skipped} dump-dependent group(s) SKIPPED (set KDC_DUMP for full)')

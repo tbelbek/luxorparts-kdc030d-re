@@ -311,7 +311,8 @@ def _build_patched(backup, ticks, guard=False):
         struct.pack_into('<I', patched, 0x9f70 - SECTOR, GUARD_NEW)
     diff = {SECTOR + i for i in range(0x1000) if patched[i] != backup[SECTOR + i]}
     allowed = MANAGED_GUARD if guard else MANAGED
-    assert diff <= allowed, f'unexpected diff {sorted(hex(x) for x in diff)}; refusing'
+    if not (diff <= allowed):        # sys.exit (not assert) so the containment check holds under `python -O`
+        sys.exit(f'built patch touches unexpected bytes {sorted(hex(x) for x in diff - allowed)}; refusing')
     return bytes(patched), cur
 
 
@@ -352,6 +353,15 @@ def flashpatch(backup_path, ticks, confirm, guard=False):
     print('\nerase-granule preflight (writes a blank scratch block, proves 0x20 = 4KB)...')
     _granule_preflight(bot)
     cmd = _upload_payload(bot, (SECTOR, SECTOR + 0x1000))   # re-upload the 0x9000-windowed payload
+    # Re-read and RE-VALIDATE sector 0x9000 at erase time (the preflight above writes flash, so re-gate here
+    # rather than trusting the pre-preflight read) — same guard flash_edits applies before it overwrites.
+    live2 = _read_range(cmd, SECTOR, 0x1000)
+    if live2 == patched:
+        print('  sector 0x9000 already matches the patched image — nothing to do.'); bot.release(); return
+    late = [SECTOR + i for i in range(0x1000) if i not in managed_rel and live2[i] != orig_sector[i]]
+    if late:
+        bot.release(); sys.exit(f'sector 0x{SECTOR:x} changed OUTSIDE the managed bytes before erase '
+                                f'({len(late)} offsets, first {late[:4]}); aborting without writing')
     print('\n*** WRITING sector 0x9000 (erase + 16 pages + verify) ***')
     _write_sector(cmd, SECTOR, patched)        # guarded to 0x9000; exits with a recovery hint on any failure
     print('  VERIFY OK: sector matches patched image; delay immediates (0x9f48/0x9f64)' +
