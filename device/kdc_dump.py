@@ -14,22 +14,19 @@ The loader resets itself ~2-3 s after the last USB traffic (back to stock firmwa
 Protocol: github.com/matu6968/Action_Digital_Kids_Camera_DOOM (tools/python/apxtool).
 macOS: run with sudo (libusb needs root to detach the mass-storage driver).
 """
-import hashlib, os, struct, sys, time
+import hashlib, struct, sys, time
 from pathlib import Path
 import usb.core, usb.util, usb.backend.libusb1
 
-BACKEND = usb.backend.libusb1.get_backend(find_library=lambda _: os.environ.get('KDC_LIBUSB','/opt/homebrew/lib/libusb-1.0.dylib'))
+BACKEND = usb.backend.libusb1.get_backend(find_library=lambda _: '/opt/homebrew/lib/libusb-1.0.dylib')
 STOCK_IDS = ((0x0219, 0x3280), (0x1908, 0x3283))
 LOADER_ID = (0x1908, 0x3319)
 ROM_FN = 0x00102620                      # BootROM 0xCB memory helper, same address in both known ROMs
 ROM_BASE = 0x00100000
-# Reference BootROMs (NOT redistributed here — fetch from upstream, see README):
-#   soc_boot_rom.bin      from github.com/hidoba/penguin-camera (assets/rom/)
-#   bootrom_matu_64k.bin  from github.com/matu6968/Action_Digital_Kids_Camera_DOOM (dumps/)
-ROMDIR = Path(os.environ.get('KDC_ROM_DIR', Path(__file__).resolve().parent.parent / 'refs'))
-ROM_REFS = {
-    ROMDIR / 'bootrom_matu_64k.bin': 'f5b68ff45bff5f4f21c49008ed0a4bcbab01f2a2cb5aeff8f832ee41be460e39',  # JT5295 64K
-    ROMDIR / 'soc_boot_rom.bin': '62d4dabeeca22efddc11ea0fa95a5a0823e1897e35659c9b5ae0bc47f4205eef',      # AX3295B 32K
+HERE = Path(__file__).resolve().parent.parent
+ROM_REFS = {                             # path -> sha256 of the two published BootROMs
+    HERE / 'dl-matu/repo/dumps/bootrom_0x00100000_64K.bin': 'f5b68ff45bff5f4f21c49008ed0a4bcbab01f2a2cb5aeff8f832ee41be460e39',  # JT5295
+    HERE / 'dl-penguin/repo/assets/rom/soc_boot_rom.bin': '62d4dabeeca22efddc11ea0fa95a5a0823e1897e35659c9b5ae0bc47f4205eef',      # AX3295B
 }
 HELPER = ((0x2530, 0x2584), (0x2620, 0x265C))   # the read path 0xCB executes; identical in both ROMs
 # Fingerprints checked before any vendor command. STOCK_*: this camera's descriptors, found

@@ -9,9 +9,35 @@ This repo holds the tooling and findings. It is defensive, educational RE of har
 own. **No vendor firmware is redistributed here** — the reference BootROM/firmware images
 come from the upstream projects linked below; point `KDC_ROM_DIR` at your local copies.
 
-> Status: **diagnosis complete; on-device flash dump in progress.** The delay mechanism is
-> identified in a byte-identical sibling firmware; a read-only on-device dump of *this*
-> unit's own firmware is the remaining step (see [Current status](#current-status)).
+> Status: **SOLVED — no case opening.** This unit's own firmware was dumped over USB (0xDA
+> BootROM loader + a hand-ported, position-independent flasher payload with its own SPI
+> driver — no vendor addresses, no SPI clip, no soldering). cmd0 returned JEDEC `5e4016`;
+> cmd1 returned real flash (BLDR boot header at +4). A 32 KiB app dump confirmed the
+> **shutter lag is a hard-coded ~1000-tick wait** in the capture routine: at RAM
+> `0x02007b48` (flash ≈ `0x9f48`) `l.addi r18,r24,1000` sets `deadline = uptime() + 1000`,
+> and the frame is grabbed only after that deadline — independent of exposure. See
+> [How the USB dump works](#how-the-usb-dump-works) and [The cause](#the-shutter-lag-cause).
+
+## How the USB dump works
+
+No case opening, no SPI clip. The chip is an AppoTech/Buildwin loader-capable SoC, so:
+
+1. **`0xDA`** (vendor SCSI) reboots the stock firmware into its on-chip **BootROM loader**
+   (`1908:3319` "BuildWin Video050Loader"), confirmed by USB/INQUIRY fingerprint.
+2. A small **position-independent flasher payload** (`tools/flstub.py` → `flasher.bin`, a
+   hand-port of matu's `boot/flasher.c`) is written to SRAM `0x2000` and launched through
+   the loader's `0xCB` "call" (it hands the payload its request block in `r3`). The payload
+   drives the SPI controller **with raw controller registers only** — it needs no
+   build-specific vendor function addresses, so it works on a stock camera.
+3. The payload runs command 0 (controller init + JEDEC check) then command 1 (flash read)
+   into its request block; the host reads the result back with a plain `0xCB` memory read.
+
+**What made it finally work:** the payload must preserve the callee-saved registers
+(`r14/r16/r18/r20`) it uses, or returning to the BootROM corrupts the loader and every
+follow-up USB transfer hangs. Earlier hand-assembled attempts skipped that and failed in
+six different ways; a compiled C payload preserves them automatically. The fix is in
+`flstub.py`'s entry/exit. The port is validated offline against a modeled CPU+SPI+flash
+(`tools/flsim.py`: terminates, returns the right bytes, only ever clocks `{0x9f,0x03,addr,0xFF}`).
 
 ## The device
 
@@ -51,14 +77,25 @@ and the risk accepted).
 ```
 tools/
   or1k_dis.py     minimal little-endian OpenRISC (ORBIS32) disassembler
+  flstub.py       the working flasher payload: a little-endian hand-port of matu's
+                  boot/flasher.c (cmd0 init+JEDEC, cmd1 flash read) -> flasher.bin.
+                  Needs no OpenRISC toolchain; its Asm emits LE words directly.
+  flsim.py        offline validator: runs flasher.bin on a modeled CPU+SPI+flash and
+                  checks it terminates, reads the right bytes, clocks only {0x9f,0x03,addr,0xFF}
+  stub_build.py   assembles the marker/reader/diag probe payloads (Asm lives here)
   spi_trace.py    emulates the ROM SPI-read path; logs every byte clocked to TX (SPR 0x9250)
   spi_frame.py    emulates it again; proves chip-select stays asserted for one transaction
-  stub_build.py   assembles the two SRAM payloads below (no external toolchain needed)
-  stub_marker.bin  zero-SPI probe: writes 0xCAFE to a param slot and returns
-  stub_reader.bin  READ-ONLY flash reader: only ever clocks {0x03, address, 0xFF}
+  stub_*.bin      small probe payloads (marker: zero-SPI launch test; reader/diag: experiments)
 device/
   kdc_dump.py     loader entry + USB/BootROM fingerprinting + 0xCB memory read
-  kdc_run.py      marker | reader | bootrom  (drives the SRAM payloads over USB)
+  kdc_run.py      flasher | dump | reader | marker | diag | stockread | bootrom
+                  (flasher = the working read; dump = loop it over a range to a file)
+```
+
+Dump this unit's app region (needs the camera on its USB screen, SD volume unmounted):
+```bash
+sudo venv/bin/python device/kdc_run.py flasher 0 256              # proof: JEDEC + 256 bytes @ 0
+sudo venv/bin/python device/kdc_run.py dump 0x8000 0x8000 app.bin # 32 KiB incl. the capture routine
 ```
 
 ## Safety model (why this can't brick the flash)
