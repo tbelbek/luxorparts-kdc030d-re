@@ -38,9 +38,10 @@ Detailed reverse-engineering notes behind the tooling. The README is the how-to;
   changes the slow-path `0x9f70 l.sub r3,r18,r11` (deadline − now, which can underflow in the re-sample
   race) to `l.sub r3,r18,r24` (deadline − (t0+5) = SETTLE−5, a positive constant). The delay argument can
   then never underflow, regardless of timing. One extra operand byte in sector 0x9000 (same safe/reversible
-  tier as the shutter patch; revert with `flashrestore BACKUP 0x9000 WRITE`). Trade-off: the slow path waits
-  a fixed SETTLE−5 from that point instead of the exact remainder, so it may over-wait by up to the setup
-  time (small; the common <5-tick fast path is unaffected). Opt-in because the underflow is already benign:
+  tier as the shutter patch; revert with `flashrestore BACKUP 0x9000 WRITE`). Needs ticks >= 6 (SETTLE−5 must
+  stay positive, else it would re-underflow — the tool refuses GUARD below 6, verified with Codex). Trade-off:
+  the slow path waits a fixed SETTLE−5 from that point instead of the exact remainder, over-waiting by however
+  far setup overran t0+5 (nil on the common <5-tick fast path). Opt-in because the underflow is already benign:
 - The settle computes `delay(deadline - now)`. It is reached only past the skip-branch at 0x02007b54, so the
   underflow can only come from the ~4-instruction re-sample race (0x02007b5c–70) where `now` crosses the
   deadline — i.e. by a *few* ticks. So the argument is a SMALL negative, `0xFFFFFFF_` (≈ −1…−10), not an

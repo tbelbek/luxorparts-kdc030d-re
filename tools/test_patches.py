@@ -181,7 +181,14 @@ def test_flashpatch_guard():
     # without guard, the sub is untouched
     p2, _ = R._build_patched(d, 250, guard=False)
     assert struct.unpack_from('<I', p2, 0x9f70 - sec)[0] == R.GUARD_OLD
-    print('  [ok] flashpatch GUARD: delays->250 + l.sub r11->r24 (constant, underflow-proof), diff in MANAGED_GUARD')
+    # GUARD with ticks < 6 would make SETTLE-5 <= 0 (re-underflow) and must be refused
+    for bad in (1, 5):
+        try:
+            R._build_patched(d, bad, guard=True); raised = False
+        except SystemExit:
+            raised = True
+        assert raised, f'GUARD with ticks={bad} was not refused'
+    print('  [ok] flashpatch GUARD: delays->250 + l.sub r11->r24 (positive constant); ticks<6 refused; diff in MANAGED_GUARD')
 
 
 def test_wrappers_pass_managed():

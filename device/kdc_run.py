@@ -300,6 +300,10 @@ def _build_patched(backup, ticks, guard=False):
     struct.pack_into('<I', patched, PATCH_OFF - SECTOR, (cur & 0xffff0000) | ticks)
     struct.pack_into('<I', patched, PATCH_OFF2 - SECTOR, (cur2 & 0xffff0000) | ticks)
     if guard:
+        # The guard makes the slow-path delay arg = SETTLE-5 (deadline r18 minus r24=t0+5). That must stay
+        # POSITIVE or we would re-introduce the very underflow we are removing, so require ticks >= 6.
+        if ticks < 6:
+            sys.exit(f'GUARD needs ticks >= 6 (the guarded settle is SETTLE-5; {ticks} would be <=0 and underflow)')
         g = struct.unpack_from('<I', backup, 0x9f70)[0]
         if g != GUARD_OLD:
             sys.exit(f'backup word @0x9f70 is 0x{g:08x}, not `l.sub r3,r18,r11` (0x{GUARD_OLD:08x}); refusing guard')
