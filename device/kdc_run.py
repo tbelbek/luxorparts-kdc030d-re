@@ -441,6 +441,52 @@ def patch_bytes(backup_path, spec, confirm):
     flash_edits(backup, edits, confirm, strict=True)
 
 
+# --- AWB override: fix the warm/orange indoor cast ---------------------------------------------------
+# The SP0A39 runs its factory auto-AWB — the firmware configures sensor pages 0/1/0x1d/0x20 but never
+# page 2 and never reg 0x32, so the sensor's default auto-WB reads warm indoors. The app image is fully
+# packed (no blank space) and the init is a branch-dense dispatch with no straight-line run to compact,
+# so we cannot safely ADD code/writes. Instead we repurpose the 5 TRAILING page-1 init writes IN PLACE
+# (immediate bytes only; instruction opcodes/flow/count unchanged -> no brick risk, reversible) into:
+#   write1 @0x4b1ec/0x4b1fc  0x32 = 0x05   AWB -> MANUAL (stops the auto loop overwriting the gains)
+#   write2 @0x4b20c/0x4b214  0xfd = 0x02   select page 2
+#   write3 @0x4b224/0x4b22c  0x26 = RGAIN  manual R gain  (0x80 = 1.0x)
+#   write4 @0x4b23c/0x4b244  0x27 = BGAIN  manual B gain
+#   write5 @0x4b250/0x4b260  0xfd = 0x01   restore page 1 = the original sensor-init exit state
+# Register map confirmed on SP0A39 + sibling SP0A20 (0x32 AWB-ctrl 0x15=auto/0x05=manual; page-2 0x26 R /
+# 0x27 B gain). Lower R + higher B cools the orange. Defaults 0x88/0xd0 ~ incandescent preset — TUNE on
+# device. Sacrifices the 5 original trailing fine-tune writes (0x69/0x68/0x67/0xb4/0x56); reversible by
+# `flashrestore BACKUP 0x4b000 WRITE`. Offline-validated: patched init emits exactly the 5 writes above.
+# WATCH-OUTS (test on device): auto-AWB off means WB is now FIXED (good indoors, may be too cool in
+# daylight); a resolution/mode change replays a RAM reg-table (writer @0x02049338) that could re-touch
+# the sensor. Recovery is less certain than the shutter patch — the sensor init is on the camera-on path.
+AWB_SECTOR = 0x4b000
+AWB_REG = {0x4b1ec:(0x69,0x32), 0x4b1fc:(0x00,0x05),      # 0x32 = 0x05  (disable auto-AWB, page 1)
+           0x4b20c:(0x68,0xfd), 0x4b214:(0x80,0x02),      # 0xfd = 0x02  (select page 2)
+           0x4b224:(0x67,0x26),                           # reg 0x26 (R gain); VALUE = rgain arg
+           0x4b23c:(0xb4,0x27),                           # reg 0x27 (B gain); VALUE = bgain arg
+           0x4b250:(0x56,0xfd), 0x4b260:(0x40,0x01)}      # 0xfd = 0x01  (restore page 1)
+AWB_RGAIN_OFF, AWB_BGAIN_OFF = 0x4b22c, 0x4b244           # orig 0x80 / 0xf1
+AWB_HI = (0x4b215, 0x4b22d, 0x4b23d, 0x4b245)             # high bytes of originally-negative immediates -> 0x00
+
+
+def awb(backup_path, rgain, bgain, confirm):
+    backup = open(backup_path, 'rb').read()
+    for off, (orig, _new) in AWB_REG.items():            # gate: refuse on any firmware that isn't this exact image
+        if backup[off] != orig:
+            sys.exit(f'AWB gate: flash 0x{off:x}=0x{backup[off]:02x}, expected 0x{orig:02x} (unknown firmware); refusing')
+    if backup[AWB_RGAIN_OFF] != 0x80 or backup[AWB_BGAIN_OFF] != 0xf1:
+        sys.exit('AWB gate: gain-immediate sites differ from the known image; refusing')
+    edits = {off: new for off, (_orig, new) in AWB_REG.items()}
+    edits[AWB_RGAIN_OFF] = rgain & 0xff
+    edits[AWB_BGAIN_OFF] = bgain & 0xff
+    for o in AWB_HI: edits[o] = 0x00
+    print('AWB override (repurpose 5 trailing page-1 sensor-init writes; immediates only, reversible):')
+    print('  page1 0x32=0x05 (auto-AWB OFF) -> page2 0x26(R)=0x%02x 0x27(B)=0x%02x -> page1 restore' % (rgain & 0xff, bgain & 0xff))
+    print('  0x80=1.0x gain; lower R / higher B cools the warm cast. Tune the two values and re-flash to taste.')
+    print(f'  {len(edits)} immediate bytes in sector 0x{AWB_SECTOR:x}. Revert: flashrestore BACKUP 0x{AWB_SECTOR:x} WRITE')
+    flash_edits(backup, edits, confirm, strict=True)
+
+
 def silence_sounds(backup_path, confirm):
     # Silence the power-on/off jingles (the two longest WAVs) by zeroing their PCM SAMPLES to 0x00
     # (= silence). The player ignores the WAV header length, so zeroing the samples themselves is the
@@ -461,27 +507,30 @@ def silence_sounds(backup_path, confirm):
     flash_edits(backup, edits, confirm, strict=False)  # non-strict: re-patches over the earlier header change
 
 
-def flashrestore(backup_path, confirm):
-    # Recovery: rewrite sector 0x9000 from the backup (no equality gate). Dry-run unless confirm=='WRITE'.
+def flashrestore(backup_path, confirm, sector=SECTOR):
+    # Recovery: rewrite one 4 KiB sector from the backup (no equality gate). Dry-run unless confirm=='WRITE'.
+    # Default sector 0x9000 (shutter); pass another to revert a different patch, e.g. 0x4b000 (AWB), 0x6d000
+    # (jpeg-quality). Any sector is recoverable this way as long as the device still boots into the loader.
+    assert sector & 0xfff == 0, 'sector must be 4KB-aligned'
     backup = open(backup_path, 'rb').read()
-    assert len(backup) >= 0x10000, 'backup too short'
-    orig_sector = backup[SECTOR:SECTOR + 0x1000]
+    assert len(backup) >= sector + 0x1000, 'backup too short for that sector'
+    orig_sector = backup[sector:sector + 0x1000]
     bot = enter_loader()
-    cmd = _upload_payload(bot, (SECTOR, SECTOR + 0x1000))
+    cmd = _upload_payload(bot, (sector, sector + 0x1000))
     st, jd = cmd(0, 0, 3)
     print(f'  cmd0 init+JEDEC: status 0x{st:x} JEDEC {jd.hex()}')
     if st != 0 or jd != JEDEC: bot.release(); sys.exit('JEDEC probe failed; refusing')
-    live = _read_range(cmd, SECTOR, 0x1000)
-    print(f'  live sector 0x{SECTOR:x} == backup? {live == orig_sector}')
+    live = _read_range(cmd, sector, 0x1000)
+    print(f'  live sector 0x{sector:x} == backup? {live == orig_sector}')
     if confirm != 'WRITE':
         print('\nDRY RUN (nothing written — only JEDEC + sector read). Re-run with final arg WRITE to erase+reprogram from backup.')
         bot.release(); return
     print('\nerase-granule preflight (writes a blank scratch block, proves 0x20 = 4KB)...')
     _granule_preflight(bot)
-    cmd = _upload_payload(bot, (SECTOR, SECTOR + 0x1000))   # re-upload the 0x9000-windowed payload
-    print('\n*** RESTORING sector 0x9000 from backup ***')
-    _write_sector(cmd, SECTOR, orig_sector)
-    print('  RESTORE OK: sector 0x9000 matches backup. Power-cycle to return to stock.')
+    cmd = _upload_payload(bot, (sector, sector + 0x1000))   # re-upload the windowed payload for this sector
+    print(f'\n*** RESTORING sector 0x{sector:x} from backup ***')
+    _write_sector(cmd, sector, orig_sector)
+    print(f'  RESTORE OK: sector 0x{sector:x} matches backup. Power-cycle to return to stock.')
     bot.release()
 
 
@@ -531,10 +580,20 @@ if __name__ == '__main__':
         cf = sys.argv[4] if len(sys.argv) > 4 else 'DRY'
         flashpatch(bpath, tk, cf)
     elif len(sys.argv) >= 2 and sys.argv[1] == 'flashrestore':
-        # flashrestore BACKUP [WRITE]   (restores sector 0x9000 from backup; dry run unless WRITE)
+        # flashrestore BACKUP [SECTOR=0x9000] [WRITE]   (restore one sector from backup; dry run unless WRITE)
         bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
-        cf = sys.argv[3] if len(sys.argv) > 3 else 'DRY'
-        flashrestore(bpath, cf)
+        rest = sys.argv[3:]
+        sec = next((int(x, 0) for x in rest if x != 'WRITE'), SECTOR)
+        cf = 'WRITE' if 'WRITE' in rest else 'DRY'
+        flashrestore(bpath, cf, sec)
+    elif len(sys.argv) >= 2 and sys.argv[1] == 'awb':
+        # awb BACKUP [RGAIN=0x88 BGAIN=0xd0] [WRITE]   (fix the warm/orange cast; dry run unless WRITE)
+        bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
+        nums = [int(x, 0) for x in sys.argv[3:] if x != 'WRITE']
+        rg = nums[0] if len(nums) > 0 else 0x88
+        bg = nums[1] if len(nums) > 1 else 0xd0
+        cf = 'WRITE' if 'WRITE' in sys.argv[3:] else 'DRY'
+        awb(bpath, rg, bg, cf)
     elif len(sys.argv) >= 2 and sys.argv[1] == 'silence-sounds':
         # silence-sounds BACKUP [WRITE]   (zero the 2 longest WAVs' size fields; dry run unless WRITE)
         bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
@@ -560,4 +619,5 @@ if __name__ == '__main__':
         marker()
     else:
         sys.exit('usage: kdc_run.py dump START LEN [out] | flasher [addr] [len] | flashpatch | '
-                 'flashrestore | silence-sounds | patch | jpeg-quality | stockread | bootrom | marker')
+                 'flashrestore [SECTOR] | silence-sounds | patch | jpeg-quality | awb [R B] | '
+                 'stockread | bootrom | marker')
