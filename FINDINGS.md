@@ -55,15 +55,38 @@ Detailed reverse-engineering notes behind the tooling. The README is the how-to;
   `SP0A39_SCCB_ADDR 0x21`, `SP0A39_PID 0x0a39` — firmware checks the low ID byte `0x39` (at 0x020489d8).
   Native 640x480; all larger photo sizes (incl. 9280x5160) are upscales. Integrated auto-AWB.
 - Sensor registers are written 8-bit over SCCB via `sccb_write` (RAM 0x02047a34); the init is INLINE
-  (137 writes, main func 0x02047d44), pages selected by reg 0xfd. Our firmware writes pages 0/1
-  (format/gain/saturation) but does NOT configure page-2 AWB -> the SP0A39 runs its factory auto-AWB.
-  The warm/orange cast under indoor light is that default AWB; correcting it needs ADDED page-2 writes.
+  (137 writes, main func 0x02047d44), pages selected by reg 0xfd. A reliable reg/val scan shows the
+  firmware selects pages **0, 1, 0x1d, 0x20 — NEVER page 2 — and never writes reg 0x32**, so the SP0A39
+  runs its factory auto-AWB. The warm/orange cast under indoor light is that default AWB.
 
-## There is NO thermal printer in this unit
-Despite the "instant-print" framing, the firmware has no printer: the menu is Photo / Video (720P/1080P) /
-Audio (MP3) / Music List / Games / settings — no Print mode. The "print"/"Print" strings are Photoshop
-resource metadata embedded in a JPEG asset (`8BIM`, `printOutput`, `cropWhenPrinting`); "head" is an MP3
-decoder error string. No print-head driver, dither, paper/motor code exists. (Thermal-print quality: N/A.)
+### AWB fix — delivered (`awb` mode), confirmed map
+- Register map confirmed on SP0A39 + sibling SP0A20: page-1 **0x32 = AWB control** (0x15 auto / 0x05
+  manual); page-2 **0x26 = R gain, 0x27 = B gain** (0x80 = 1.0x). The auto-AWB loop runs continuously and
+  overwrites manual gains unless you set 0x32=0x05 FIRST. Lower R / higher B cools the orange.
+- Could NOT inject code: the app image is 100% packed (ZERO 0xFF runs in flash 0x2400..0x7ea00) and every
+  >=256 B 0x00 gap is live data (e.g. 0x6e538 is referenced), and the init is a 102-branch-target dispatch
+  with no straight-line run to compact. Code/hook injection has no safe home here (confirmed with Codex).
+- Instead: **repurpose the 5 trailing page-1 init writes IN PLACE** — only l.addi immediate operand bytes
+  change (opcodes/flow/count identical), so it is the same brick-safe, reversible tier as the shutter patch,
+  NOT a code injection. The patched init emits: `0x32=0x05` (manual) -> `0xfd=0x02` -> `0x26=R` -> `0x27=B`
+  -> `0xfd=0x01` (restore the original page-1 exit state). Offline-validated (exact sequence; every changed
+  word still l.addi; all in sector 0x4b000). Sacrifices the 5 original trailing fine-tune writes
+  (0x69/0x68/0x67/0xb4/0x56), reversible via `flashrestore DUMP 0x4b000 WRITE`.
+- Run `awb DUMP [RGAIN BGAIN] WRITE` (defaults 0x88/0xd0, ~incandescent). WATCH on device: WB is now FIXED
+  (good indoors, may be too cool in daylight); a resolution/mode change replays a RAM reg-table (writer
+  @0x02049338) that could re-touch the sensor — recheck WB after switching modes. Post-init writer #2
+  (@0x02049538) writes reg 0x31 (not 0x32/0x26/0x27) so it does not undo the override.
+
+## Thermal printer IS present (correction)
+An earlier note here wrongly concluded "no printer" (it had latched onto Photoshop `8BIM`/`printOutput`
+metadata in a JPEG asset and an MP3 "head" string). The unit DOES have the built-in ink-free thermal
+printer (Kjell product page: "makes black-and-white prints without ink, using thermal paper"). The print
+path was then found by hardware pattern: 58 mm head, **384 dots/line = 48 bytes**, with TWO tone modes —
+a fixed global threshold (128) and a 32-plane grayscale halftone ramp (thresholds 0,8,…,248). Head bit-bang
+via SPR 0x800c (data bit 0x8000, clock 0x2000), strobe via 0x8004. Tunable value-knobs for both tone modes
+are in `docs/KNOBS.md` (threshold 0x4d440, ramp step 0x4cb5c). A true gamma/dither curve would need code
+injection, which (as the AWB section shows) has no safe home in this packed image — the linear knobs are
+the safe reach; the gamma/dither version is documented but NOT flashed.
 
 ## JPEG photo quality
 - Still photos use quant **set B** (RAM 0x0206ada4 / flash 0x6d1a4), ~Q45. Confirmed by a real photo's DQT.

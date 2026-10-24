@@ -23,6 +23,25 @@ The print path has TWO tone modes. Confirm which your unit uses by testing.
   NOP it (4 bytes) to drop the debug dump from that path:
   `patch DUMP 0x37414=0x00,0x37415=0x00,0x37416=0x00,0x37417=0x15 WRITE`  (0x15000000 = l.nop)
 
+## White balance — fix the warm/orange indoor cast (`awb` command, NOT a `patch` knob)
+The SP0A39 runs factory auto-AWB (firmware never configures it). `awb` repurposes the 5 trailing page-1
+sensor-init writes IN PLACE (l.addi immediate operand bytes only — same reversible, boots-to-loader recovery
+tier as the shutter patch) into: page1 `0x32=0x05` (auto-AWB OFF) → page2 `0x26`=R-gain, `0x27`=B-gain →
+page1 restore. `0x80`=1.0x; **lower R / higher B cools the orange.**
+```bash
+sudo venv/bin/python device/kdc_run.py awb YOUR-4MB-DUMP.bin [RGAIN BGAIN] WRITE   # defaults 0x88 0xd0
+```
+- Dry-run first (omit `WRITE`). Retune by re-running with new R/B (it rewrites the sector from the clean
+  backup each time — always pass the ORIGINAL dump). Full revert: `flashrestore DUMP 0x4b000 WRITE`.
+- Starting points (SP0A20 sibling presets, 0x80=1.0x): incandescent `0x88 0xd0` (default, strongest cool),
+  fluorescent `0xbf 0xcc`, neutral `0xac 0xad`. Tune on device.
+- WATCH: auto-AWB is now OFF so WB is FIXED — great indoors, may look cool in daylight. After a
+  resolution/mode change the firmware replays a RAM sensor table that could re-touch WB; recheck.
+
+## Revert any single patch
+`flashrestore DUMP [SECTOR] WRITE` rewrites one 4 KiB sector from the backup. Default sector `0x9000`
+(shutter); pass `0x4b000` (AWB), `0x6d000` (jpeg-quality), or a print-knob sector to revert that patch.
+
 ## Already applied earlier (for reference)
 - Shutter lag: `flashpatch DUMP 250 WRITE` (both delay immediates 0x9f48/0x9f64).
 - Power sounds: `silence-sounds DUMP WRITE`.

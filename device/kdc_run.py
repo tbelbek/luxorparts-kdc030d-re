@@ -446,7 +446,10 @@ def patch_bytes(backup_path, spec, confirm):
 # page 2 and never reg 0x32, so the sensor's default auto-WB reads warm indoors. The app image is fully
 # packed (no blank space) and the init is a branch-dense dispatch with no straight-line run to compact,
 # so we cannot safely ADD code/writes. Instead we repurpose the 5 TRAILING page-1 init writes IN PLACE
-# (immediate bytes only; instruction opcodes/flow/count unchanged -> no brick risk, reversible) into:
+# (immediate operand bytes only; instruction opcodes/flow/count unchanged -> same operand-patch recovery
+# tier as the shutter patch: the device still boots to the USB loader for `flashrestore`. NOT absolute —
+# the sensor init is on the camera-on path, and the 5 sacrificed fine-tune writes' effect on capture/
+# sensor-readiness cannot be proven offline; bench-verify and keep the backup) into:
 #   write1 @0x4b1ec/0x4b1fc  0x32 = 0x05   AWB -> MANUAL (stops the auto loop overwriting the gains)
 #   write2 @0x4b20c/0x4b214  0xfd = 0x02   select page 2
 #   write3 @0x4b224/0x4b22c  0x26 = RGAIN  manual R gain  (0x80 = 1.0x)
@@ -460,31 +463,46 @@ def patch_bytes(backup_path, spec, confirm):
 # daylight); a resolution/mode change replays a RAM reg-table (writer @0x02049338) that could re-touch
 # the sensor. Recovery is less certain than the shutter patch — the sensor init is on the camera-on path.
 AWB_SECTOR = 0x4b000
-AWB_REG = {0x4b1ec:(0x69,0x32), 0x4b1fc:(0x00,0x05),      # 0x32 = 0x05  (disable auto-AWB, page 1)
-           0x4b20c:(0x68,0xfd), 0x4b214:(0x80,0x02),      # 0xfd = 0x02  (select page 2)
-           0x4b224:(0x67,0x26),                           # reg 0x26 (R gain); VALUE = rgain arg
-           0x4b23c:(0xb4,0x27),                           # reg 0x27 (B gain); VALUE = bgain arg
-           0x4b250:(0x56,0xfd), 0x4b260:(0x40,0x01)}      # 0xfd = 0x01  (restore page 1)
-AWB_RGAIN_OFF, AWB_BGAIN_OFF = 0x4b22c, 0x4b244           # orig 0x80 / 0xf1
-AWB_HI = (0x4b215, 0x4b22d, 0x4b23d, 0x4b245)             # high bytes of originally-negative immediates -> 0x00
+# Each site: flash_off -> (original 32-bit LE instruction word, new low-16 immediate | None for a gain arg).
+# We validate the FULL original word at every site (not just a byte) so this refuses on any image that is
+# not this exact firmware. Writing the new low-16 (both bytes) turns the originally-negative immediates
+# (0xff80 etc.) positive, and l.sb stores only the low byte, so the sensor sees the intended register/value.
+AWB_SITES = [
+    (0x4b1ec, 0x9c400069, 0x0032),   # write1 reg -> 0x32
+    (0x4b1fc, 0x9c600000, 0x0005),   # write1 val -> 0x05   (0x32=0x05: disable auto-AWB, page 1)
+    (0x4b20c, 0x9c400068, 0x00fd),   # write2 reg -> 0xfd
+    (0x4b214, 0x9c60ff80, 0x0002),   # write2 val -> 0x02   (0xfd=0x02: select page 2)
+    (0x4b224, 0x9c400067, 0x0026),   # write3 reg -> 0x26   (R gain register)
+    (0x4b22c, 0x9c60ff80, None),     # write3 val -> RGAIN arg
+    (0x4b23c, 0x9c40ffb4, 0x0027),   # write4 reg -> 0x27   (B gain register)
+    (0x4b244, 0x9c60fff1, None),     # write4 val -> BGAIN arg
+    (0x4b250, 0x9c400056, 0x00fd),   # write5 reg -> 0xfd
+    (0x4b260, 0x9c600040, 0x0001),   # write5 val -> 0x01   (0xfd=0x01: restore the original page-1 exit state)
+]
 
 
 def awb(backup_path, rgain, bgain, confirm):
+    if not (0 <= rgain <= 0xff and 0 <= bgain <= 0xff):
+        sys.exit('AWB: RGAIN and BGAIN must each be 0..255 (0x00..0xff)')
     backup = open(backup_path, 'rb').read()
-    for off, (orig, _new) in AWB_REG.items():            # gate: refuse on any firmware that isn't this exact image
-        if backup[off] != orig:
-            sys.exit(f'AWB gate: flash 0x{off:x}=0x{backup[off]:02x}, expected 0x{orig:02x} (unknown firmware); refusing')
-    if backup[AWB_RGAIN_OFF] != 0x80 or backup[AWB_BGAIN_OFF] != 0xf1:
-        sys.exit('AWB gate: gain-immediate sites differ from the known image; refusing')
-    edits = {off: new for off, (_orig, new) in AWB_REG.items()}
-    edits[AWB_RGAIN_OFF] = rgain & 0xff
-    edits[AWB_BGAIN_OFF] = bgain & 0xff
-    for o in AWB_HI: edits[o] = 0x00
-    print('AWB override (repurpose 5 trailing page-1 sensor-init writes; immediates only, reversible):')
-    print('  page1 0x32=0x05 (auto-AWB OFF) -> page2 0x26(R)=0x%02x 0x27(B)=0x%02x -> page1 restore' % (rgain & 0xff, bgain & 0xff))
-    print('  0x80=1.0x gain; lower R / higher B cools the warm cast. Tune the two values and re-flash to taste.')
-    print(f'  {len(edits)} immediate bytes in sector 0x{AWB_SECTOR:x}. Revert: flashrestore BACKUP 0x{AWB_SECTOR:x} WRITE')
-    flash_edits(backup, edits, confirm, strict=True)
+    if len(backup) < AWB_SECTOR + 0x1000:
+        sys.exit('AWB: backup too short')
+    for off, orig_word, _imm in AWB_SITES:               # gate: full-word match => refuse on any other image
+        live = struct.unpack_from('<I', backup, off)[0]
+        if live != orig_word:
+            sys.exit(f'AWB gate: flash 0x{off:x} word {live:08x} != expected {orig_word:08x} (not this firmware); refusing')
+    edits = {}
+    for off, _ow, imm in AWB_SITES:
+        v = imm if imm is not None else (rgain if off == 0x4b22c else bgain)
+        edits[off] = v & 0xff; edits[off + 1] = (v >> 8) & 0xff
+    print('AWB override (repurpose 5 trailing page-1 sensor-init writes; l.addi immediates only -> same')
+    print('  operand-patch recovery tier as the shutter patch, reversible; NOT a code/hook injection):')
+    print('  page1 0x32=0x05 (auto-AWB OFF) -> page2 0x26(R)=0x%02x 0x27(B)=0x%02x -> restore page 1' % (rgain, bgain))
+    print('  0x80=1.0x gain; lower R / higher B cools the warm cast.')
+    print(f'  retune: re-run with new R/B (it rewrites the sector from this clean backup each time).')
+    print(f'  {len(edits)} immediate bytes in sector 0x{AWB_SECTOR:x}. Full revert: flashrestore BACKUP 0x{AWB_SECTOR:x} WRITE')
+    flash_edits(backup, edits, confirm, strict=False)    # non-strict: target is deterministic from the clean
+                                                         # backup, so a prior awb run can be re-patched/retuned
 
 
 def silence_sounds(backup_path, confirm):
@@ -511,9 +529,11 @@ def flashrestore(backup_path, confirm, sector=SECTOR):
     # Recovery: rewrite one 4 KiB sector from the backup (no equality gate). Dry-run unless confirm=='WRITE'.
     # Default sector 0x9000 (shutter); pass another to revert a different patch, e.g. 0x4b000 (AWB), 0x6d000
     # (jpeg-quality). Any sector is recoverable this way as long as the device still boots into the loader.
-    assert sector & 0xfff == 0, 'sector must be 4KB-aligned'
+    if sector & 0xfff or not (0 <= sector <= 0x3ff000):
+        sys.exit(f'flashrestore: sector 0x{sector:x} must be 4KB-aligned and within 0..0x3ff000')
     backup = open(backup_path, 'rb').read()
-    assert len(backup) >= sector + 0x1000, 'backup too short for that sector'
+    if len(backup) < sector + 0x1000:
+        sys.exit('flashrestore: backup too short for that sector')
     orig_sector = backup[sector:sector + 0x1000]
     bot = enter_loader()
     cmd = _upload_payload(bot, (sector, sector + 0x1000))
@@ -584,7 +604,7 @@ if __name__ == '__main__':
         bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
         rest = sys.argv[3:]
         sec = next((int(x, 0) for x in rest if x != 'WRITE'), SECTOR)
-        cf = 'WRITE' if 'WRITE' in rest else 'DRY'
+        cf = 'WRITE' if sys.argv[-1] == 'WRITE' else 'DRY'   # WRITE must be the literal LAST arg
         flashrestore(bpath, cf, sec)
     elif len(sys.argv) >= 2 and sys.argv[1] == 'awb':
         # awb BACKUP [RGAIN=0x88 BGAIN=0xd0] [WRITE]   (fix the warm/orange cast; dry run unless WRITE)
@@ -592,7 +612,7 @@ if __name__ == '__main__':
         nums = [int(x, 0) for x in sys.argv[3:] if x != 'WRITE']
         rg = nums[0] if len(nums) > 0 else 0x88
         bg = nums[1] if len(nums) > 1 else 0xd0
-        cf = 'WRITE' if 'WRITE' in sys.argv[3:] else 'DRY'
+        cf = 'WRITE' if sys.argv[-1] == 'WRITE' else 'DRY'   # WRITE must be the literal LAST arg
         awb(bpath, rg, bg, cf)
     elif len(sys.argv) >= 2 and sys.argv[1] == 'silence-sounds':
         # silence-sounds BACKUP [WRITE]   (zero the 2 longest WAVs' size fields; dry run unless WRITE)
