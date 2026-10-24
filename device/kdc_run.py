@@ -289,7 +289,8 @@ def _build_patched(backup, ticks, guard=False):
     #   underflow. Trade-off: the slow path then waits a fixed SETTLE-5 from that point instead of the exact
     #   remainder, i.e. it may over-wait by up to the setup time (small; the common <5-tick fast path is
     #   unaffected). One extra operand byte, same sector 0x9000, reversible via flashrestore.
-    assert 1 <= ticks <= 32767, 'ticks must be 1..32767 (a positive l.addi immediate; >32767 would be negative)'
+    if not (1 <= ticks <= 32767):    # sys.exit (not assert) so it holds under `python -O`
+        sys.exit('ticks must be 1..32767 (a positive l.addi immediate; >32767 would be negative)')
     cur = struct.unpack_from('<I', backup, PATCH_OFF)[0]
     cur2 = struct.unpack_from('<I', backup, PATCH_OFF2)[0]
     if (cur >> 16) != 0x9e58 or (cur & 0xffff) != 1000:
@@ -498,7 +499,8 @@ def print_tone(backup_path, threshold, confirm):
         sys.exit(f'print-tone: site @0x{PRINT_THRESH_OFF:x} word {w:08x} != expected {PRINT_THRESH_WORD:08x}; refusing')
     edits = print_tone_edits(threshold)
     print(f'print tone: fixed-mode threshold 128 -> {threshold} (0x{threshold:02x}); higher = darker.')
-    print(f'  pixel <= threshold prints black (assumes head bit 0x8000 = energized/black — confirm on 1st print).')
+    print(f'  pixel <= threshold prints black (firmware SETS head data bit 0x8000 for dark pixels, clears it')
+    print(f'  for bright, clocked by 0x2000 = the ink/mark bit; physical head strobe polarity: glance at 1st print).')
     print(f'  retune by re-running; full revert: flashrestore BACKUP 0x4d000 WRITE.')
     flash_edits(backup, edits, confirm, strict=True, managed=set(edits.keys()))   # re-tunable; only our 2 bytes may differ
 

@@ -11,7 +11,11 @@ sudo venv/bin/python device/kdc_run.py patch YOUR-4MB-DUMP.bin 0xOFF=0xVAL[,0xOF
 The print path has TWO tone modes. Confirm which your unit uses by testing (print a photo and see whether it
 is 1-bit harsh or has grey shading).
 - **Fixed-threshold mode** — one global threshold decides black/white per dot. A pixel prints BLACK when
-  `pixel <= threshold`, so **higher threshold = more black = DARKER; lower = lighter.** Dedicated command:
+  `pixel <= threshold`, so **higher threshold = more black = DARKER; lower = lighter.** This direction is
+  corroborated by the firmware's own convention: the print loop SETS head data bit 0x8000 for a dark pixel
+  and CLEARS it for a bright one, then pulses the 0x2000 clock — i.e. the data bit is the ink/mark bit. (The
+  only residual is the physical head's strobe polarity, a hardware property — glance at the first print.)
+  Dedicated command:
   ```bash
   sudo venv/bin/python device/kdc_run.py print-tone YOUR-4MB-DUMP.bin [THRESHOLD] WRITE   # default 0x90
   ```
