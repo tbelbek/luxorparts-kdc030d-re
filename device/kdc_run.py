@@ -474,6 +474,22 @@ def jpeg_quality(backup_path, q, confirm):
     flash_edits(backup, edits, confirm, strict=True)
 
 
+def patch_bytes(backup_path, spec, confirm):
+    # Generic value-patcher: spec = "0xFLASHOFF=0xVAL,0xFLASHOFF=0xVAL,..." (little tunable knobs).
+    # Each sector is rewritten from backup+edits (strict: live must still match backup). See docs/KNOBS.md.
+    backup = open(backup_path, 'rb').read()
+    edits = {}
+    for part in spec.split(','):
+        off_s, val_s = part.split('=')
+        off = int(off_s, 0); val = int(val_s, 0) & 0xff
+        assert 0 <= off < len(backup), f'offset 0x{off:x} out of range'
+        edits[off] = val
+    print(f'patch {len(edits)} byte(s):')
+    for off in sorted(edits):
+        print(f'  flash 0x{off:x}: 0x{backup[off]:02x} -> 0x{edits[off]:02x}')
+    flash_edits(backup, edits, confirm, strict=True)
+
+
 def silence_sounds(backup_path, confirm):
     # Silence the power-on/off jingles (the two longest WAVs) by zeroing their PCM SAMPLES to 0x00
     # (= silence). The player ignores the WAV header length, so zeroing the samples themselves is the
@@ -592,6 +608,11 @@ if __name__ == '__main__':
         bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
         cf = sys.argv[3] if len(sys.argv) > 3 else 'DRY'
         silence_sounds(bpath, cf)
+    elif len(sys.argv) >= 2 and sys.argv[1] == 'patch':
+        # patch BACKUP 0xOFF=0xVAL[,0xOFF=0xVAL...] [WRITE]   (generic value knobs; see docs/KNOBS.md)
+        bpath = sys.argv[2]; spec = sys.argv[3]
+        cf = 'WRITE' if 'WRITE' in sys.argv[4:] else 'DRY'
+        patch_bytes(bpath, spec, cf)
     elif len(sys.argv) >= 2 and sys.argv[1] == 'jpeg-quality':
         # jpeg-quality BACKUP [Q=90] [WRITE]   (raise the photo JPEG quant table to quality Q)
         bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
