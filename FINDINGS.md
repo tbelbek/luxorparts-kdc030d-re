@@ -33,7 +33,14 @@ Detailed reverse-engineering notes behind the tooling. The README is the how-to;
   above. The other ~53 are boot / SD / display / audio settle times (off the photo path) — necessary
   hardware timing, NOT safe to shorten.
 
-## Robustness guards (Task 5) — benign in THIS path; no safe guard adds value (checked with Codex)
+## Robustness guards (Task 5) — benign in THIS path; an opt-in deterministic guard is now shipped
+- **Delivered:** `flashpatch BACKUP 250 GUARD WRITE` applies the shutter fix AND hardens the settle: it
+  changes the slow-path `0x9f70 l.sub r3,r18,r11` (deadline − now, which can underflow in the re-sample
+  race) to `l.sub r3,r18,r24` (deadline − (t0+5) = SETTLE−5, a positive constant). The delay argument can
+  then never underflow, regardless of timing. One extra operand byte in sector 0x9000 (same safe/reversible
+  tier as the shutter patch; revert with `flashrestore BACKUP 0x9000 WRITE`). Trade-off: the slow path waits
+  a fixed SETTLE−5 from that point instead of the exact remainder, so it may over-wait by up to the setup
+  time (small; the common <5-tick fast path is unaffected). Opt-in because the underflow is already benign:
 - The settle computes `delay(deadline - now)`. It is reached only past the skip-branch at 0x02007b54, so the
   underflow can only come from the ~4-instruction re-sample race (0x02007b5c–70) where `now` crosses the
   deadline — i.e. by a *few* ticks. So the argument is a SMALL negative, `0xFFFFFFF_` (≈ −1…−10), not an

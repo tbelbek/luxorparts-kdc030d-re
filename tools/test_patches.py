@@ -164,6 +164,26 @@ def test_flash_edits_integration():
     print('  [ok] flash_edits integration: unmanaged change at erase time -> abort, nothing written')
 
 
+def test_flashpatch_guard():
+    global skipped
+    if d is None:
+        skipped += 1; print('  [skip] flashpatch guard (no KDC_DUMP)'); return
+    # the REAL _build_patched with guard=True: both delay immediates -> 250, and the settle sub operand
+    # changes r11 -> r24 so r3 becomes a positive constant (underflow-proof); diff stays within MANAGED_GUARD
+    patched, _cur = R._build_patched(d, 250, guard=True)
+    sec = R.SECTOR
+    assert struct.unpack_from('<I', patched, R.PATCH_OFF - sec)[0] & 0xffff == 250
+    assert struct.unpack_from('<I', patched, R.PATCH_OFF2 - sec)[0] & 0xffff == 250
+    assert struct.unpack_from('<I', patched, 0x9f70 - sec)[0] == R.GUARD_NEW
+    assert dis(R.GUARD_NEW, 0x02007b70) == 'l.sub r3,r18,r24'
+    diff = {sec + i for i in range(0x1000) if patched[i] != d[sec + i]}
+    assert diff <= R.MANAGED_GUARD, sorted(hex(x) for x in diff)
+    # without guard, the sub is untouched
+    p2, _ = R._build_patched(d, 250, guard=False)
+    assert struct.unpack_from('<I', p2, 0x9f70 - sec)[0] == R.GUARD_OLD
+    print('  [ok] flashpatch GUARD: delays->250 + l.sub r11->r24 (constant, underflow-proof), diff in MANAGED_GUARD')
+
+
 def test_wrappers_pass_managed():
     global skipped
     if d is None:
@@ -191,6 +211,7 @@ if __name__ == '__main__':
     test_jpeg_quality()
     test_managed_guard_real()
     test_flash_edits_integration()
+    test_flashpatch_guard()
     test_wrappers_pass_managed()
     if skipped:
         print(f'  PASSED (constants/builder checks) — {skipped} dump-dependent group(s) SKIPPED (set KDC_DUMP for full)')

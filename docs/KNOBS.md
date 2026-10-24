@@ -56,7 +56,15 @@ sudo venv/bin/python device/kdc_run.py awb YOUR-4MB-DUMP.bin [RGAIN BGAIN] WRITE
 `flashrestore DUMP [SECTOR] WRITE` rewrites one 4 KiB sector from the backup. Default sector `0x9000`
 (shutter); pass `0x4b000` (AWB), `0x6d000` (jpeg-quality), or a print-knob sector to revert that patch.
 
+## Robustness guard (optional) — settle underflow hardening
+`flashpatch DUMP 250 GUARD WRITE` applies the shutter fix AND changes the slow-path settle `0x9f70
+l.sub r3,r18,r11` (deadline−now, can underflow in a nanosecond re-sample race) to `l.sub r3,r18,r24`
+(deadline−(t0+5) = a positive constant), so the `delay()` arg can never underflow. Same sector 0x9000,
+reversible with `flashrestore DUMP 0x9000 WRITE`. The underflow is already benign in practice (a huge arg
+wraps `target` below the current tick, so `delay()` returns at once), so this is opt-in; it trades the exact
+remaining-time wait for a fixed, deterministic settle (may over-wait by up to the setup time on the slow path).
+
 ## Already applied earlier (for reference)
-- Shutter lag: `flashpatch DUMP 250 WRITE` (both delay immediates 0x9f48/0x9f64).
+- Shutter lag: `flashpatch DUMP 250 WRITE` (both delay immediates 0x9f48/0x9f64; add GUARD to also harden).
 - Power sounds: `silence-sounds DUMP WRITE`.
 - Photo JPEG quality: `jpeg-quality DUMP 90 WRITE` (quant set B @0x6d1a4).

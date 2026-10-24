@@ -168,7 +168,11 @@ MAGIC = 0x52585041
 SECTOR = 0x9000          # the 4KB sector holding the shutter-lag constants
 PATCH_OFF = 0x9f48       # `l.addi r18,r24,1000` (0x9e5803e8) — the deadline (main settle)
 PATCH_OFF2 = 0x9f64      # `l.addi r3,r0,1000`   (0x9c6003e8) — the fast-path delay(1000) in the same block
-MANAGED = {PATCH_OFF, PATCH_OFF + 1, PATCH_OFF2, PATCH_OFF2 + 1}   # the only bytes flashpatch ever changes
+GUARD_OFF = 0x9f71       # rB byte of `l.sub r3,r18,r11` (0xe0725802) at 0x9f70 — the settle-underflow site
+GUARD_OLD = 0xe0725802   # l.sub r3,r18,r11  (r3 = deadline - now  -> can underflow in the re-sample race)
+GUARD_NEW = 0xe072c002   # l.sub r3,r18,r24  (r3 = deadline - (t0+5) = SETTLE-5, a positive constant: no underflow)
+MANAGED = {PATCH_OFF, PATCH_OFF + 1, PATCH_OFF2, PATCH_OFF2 + 1}   # the delay-immediate bytes flashpatch changes
+MANAGED_GUARD = MANAGED | {GUARD_OFF}                             # + the one guard byte when guard=True
 JEDEC = bytes([0x5e, 0x40, 0x16])
 
 
@@ -275,10 +279,16 @@ def _granule_preflight(bot):
     print('  CONFIRMED: 0x20 = 4KB sector erase on this chip; erasing 0x9000 stays within its own 4KB sector.')
 
 
-def _build_patched(backup, ticks):
+def _build_patched(backup, ticks, guard=False):
     # Patch BOTH delay immediates in the capture block to `ticks`:
     #   0x9f48 `l.addi r18,r24,1000` (0x9e58....) — the main deadline/settle
     #   0x9f64 `l.addi r3,r0,1000`   (0x9c60....) — the fast-path delay() arg (only hit if setup <5 ticks)
+    # With guard=True also harden the settle against the deadline-underflow: change the slow-path
+    #   0x9f70 `l.sub r3,r18,r11` (deadline - now, can underflow in the re-sample race) to
+    #   `l.sub r3,r18,r24` (deadline - (t0+5) = a positive constant = SETTLE-5), so the delay arg can never
+    #   underflow. Trade-off: the slow path then waits a fixed SETTLE-5 from that point instead of the exact
+    #   remainder, i.e. it may over-wait by up to the setup time (small; the common <5-tick fast path is
+    #   unaffected). One extra operand byte, same sector 0x9000, reversible via flashrestore.
     assert 1 <= ticks <= 32767, 'ticks must be 1..32767 (a positive l.addi immediate; >32767 would be negative)'
     cur = struct.unpack_from('<I', backup, PATCH_OFF)[0]
     cur2 = struct.unpack_from('<I', backup, PATCH_OFF2)[0]
@@ -289,18 +299,26 @@ def _build_patched(backup, ticks):
     patched = bytearray(backup[SECTOR:SECTOR + 0x1000])
     struct.pack_into('<I', patched, PATCH_OFF - SECTOR, (cur & 0xffff0000) | ticks)
     struct.pack_into('<I', patched, PATCH_OFF2 - SECTOR, (cur2 & 0xffff0000) | ticks)
+    if guard:
+        g = struct.unpack_from('<I', backup, 0x9f70)[0]
+        if g != GUARD_OLD:
+            sys.exit(f'backup word @0x9f70 is 0x{g:08x}, not `l.sub r3,r18,r11` (0x{GUARD_OLD:08x}); refusing guard')
+        struct.pack_into('<I', patched, 0x9f70 - SECTOR, GUARD_NEW)
     diff = {SECTOR + i for i in range(0x1000) if patched[i] != backup[SECTOR + i]}
-    assert diff <= MANAGED, f'unexpected diff {sorted(hex(x) for x in diff)}; refusing'
+    allowed = MANAGED_GUARD if guard else MANAGED
+    assert diff <= allowed, f'unexpected diff {sorted(hex(x) for x in diff)}; refusing'
     return bytes(patched), cur
 
 
-def flashpatch(backup_path, ticks, confirm):
+def flashpatch(backup_path, ticks, confirm, guard=False):
     # Lower the shutter-lag constant and reflash ONLY sector 0x9000. Dry-run unless confirm=='WRITE'.
+    # guard=True also applies the settle-underflow hardening (0x9f70 l.sub rB r11->r24) in the same sector.
     backup = open(backup_path, 'rb').read()
     assert len(backup) >= 0x10000, 'backup too short (need >=64KB)'
     orig_sector = backup[SECTOR:SECTOR + 0x1000]
-    patched, cur = _build_patched(backup, ticks)
-    print(f'patch: delay immediates 0x{PATCH_OFF:x} and 0x{PATCH_OFF2:x}: 1000 -> {ticks} ticks (<=4 bytes in sector 0x{SECTOR:x})')
+    patched, cur = _build_patched(backup, ticks, guard)
+    print(f'patch: delay immediates 0x{PATCH_OFF:x} and 0x{PATCH_OFF2:x}: 1000 -> {ticks} ticks' +
+          (f' + settle-underflow guard @0x{GUARD_OFF:x}' if guard else '') + f' (sector 0x{SECTOR:x})')
 
     bot = enter_loader()
     # READ-ONLY phase (also the whole of a dry run): JEDEC + live-sector gate, no flash writes.
@@ -314,7 +332,7 @@ def flashpatch(backup_path, ticks, confirm):
         print('  live sector ALREADY matches the patched image — nothing to do.'); bot.release(); return
     # the live sector may already carry a PRIOR delay patch; tolerate differences only in the managed
     # delay bytes, and require everything else to still match the backup.
-    managed_rel = {o - SECTOR for o in MANAGED}
+    managed_rel = {o - SECTOR for o in (MANAGED_GUARD if guard else MANAGED)}
     unexpected = [SECTOR + i for i in range(0x1000) if i not in managed_rel and live[i] != orig_sector[i]]
     if unexpected:
         bot.release(); sys.exit(f'LIVE sector 0x{SECTOR:x} differs from backup OUTSIDE the delay bytes at '
@@ -331,7 +349,8 @@ def flashpatch(backup_path, ticks, confirm):
     cmd = _upload_payload(bot, (SECTOR, SECTOR + 0x1000))   # re-upload the 0x9000-windowed payload
     print('\n*** WRITING sector 0x9000 (erase + 16 pages + verify) ***')
     _write_sector(cmd, SECTOR, patched)        # guarded to 0x9000; exits with a recovery hint on any failure
-    print('  VERIFY OK: sector matches patched image; only the delay immediates (0x9f48/0x9f64) changed.')
+    print('  VERIFY OK: sector matches patched image; delay immediates (0x9f48/0x9f64)' +
+          (' + settle guard (0x9f70)' if guard else '') + ' changed.')
     print('  DONE. Power-cycle the camera and test the shutter.')
     bot.release()
 
@@ -670,11 +689,15 @@ if __name__ == '__main__':
         flasher(int(sys.argv[2], 0) if len(sys.argv) > 2 else 0,
                 int(sys.argv[3], 0) if len(sys.argv) > 3 else 256)
     elif len(sys.argv) >= 2 and sys.argv[1] == 'flashpatch':
-        # flashpatch BACKUP [TICKS=200] [WRITE]   (dry run unless last arg is exactly WRITE)
+        # flashpatch BACKUP [TICKS=200] [GUARD] [WRITE]   (GUARD adds the settle-underflow hardening;
+        # dry run unless the last arg is exactly WRITE)
         bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
-        tk = int(sys.argv[3], 0) if len(sys.argv) > 3 else 200
-        cf = sys.argv[4] if len(sys.argv) > 4 else 'DRY'
-        flashpatch(bpath, tk, cf)
+        rest = sys.argv[3:]
+        guard = 'GUARD' in rest
+        nums = [int(x, 0) for x in rest if x not in ('GUARD', 'WRITE')]
+        tk = nums[0] if nums else 200
+        cf = 'WRITE' if sys.argv[-1] == 'WRITE' else 'DRY'
+        flashpatch(bpath, tk, cf, guard)
     elif len(sys.argv) >= 2 and sys.argv[1] == 'flashrestore':
         # flashrestore BACKUP [SECTOR=0x9000] [WRITE]   (restore one sector from backup; dry run unless WRITE)
         bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
@@ -721,6 +744,6 @@ if __name__ == '__main__':
     elif len(sys.argv) >= 2 and sys.argv[1] == 'marker':
         marker()
     else:
-        sys.exit('usage: kdc_run.py dump START LEN [out] | flasher [addr] [len] | flashpatch | '
+        sys.exit('usage: kdc_run.py dump START LEN [out] | flasher [addr] [len] | flashpatch [TICKS] [GUARD] | '
                  'flashrestore [SECTOR] | silence-sounds | patch | jpeg-quality | print-tone [T] | '
                  'awb [R B] | stockread | bootrom | marker')
