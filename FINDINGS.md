@@ -33,14 +33,32 @@ Detailed reverse-engineering notes behind the tooling. The README is the how-to;
   above. The other ~53 are boot / SD / display / audio settle times (off the photo path) — necessary
   hardware timing, NOT safe to shorten.
 
-## Known issues / rushed markers (candidates to "idealize" — NOT yet changed)
+## Robustness guards (Task 5) — analysed, deliberately NOT patched
 - **Unsigned underflow** in the settle: the deadline is checked at 0x02007b4c–54 but the subtraction
-  sample is taken later at 0x02007b6c; if time crosses the deadline between them, `deadline - now`
-  underflows to a huge unsigned `delay()` argument. Pre-existing; a bounds check would harden it.
-- **Non-wrap-safe timestamps**: absolute unsigned `uptime()` comparisons (0x020079e4, 0x02007ae0,
-  0x02007b50) misbehave at the ~49.7-day 32-bit-ms rollover. Not practical for a camera, but sloppy.
-- **No explicit AE/exposure-valid gate** before the grab — capture is purely time-gated. Reducing the
-  settle trades latency for convergence headroom (worked at 250 ms here, but there is no feedback check).
+  sample is taken later at 0x02007b70; if time crosses the deadline between them, `deadline - now`
+  underflows to a huge unsigned `delay()` argument. BUT it is **already mitigated**: the branch at
+  0x02007b54 (`l.bf` when `now > deadline`) skips the whole settle, so the underflow can only occur in the
+  ~4-instruction re-sample window between 0x02007b5c and 0x02007b70 — a nanosecond race that essentially
+  never fires, and whose worst case is a one-time hang cured by a power-cycle (not a brick). A true guard
+  would require a clamp, i.e. CODE INJECTION into the hottest shared `delay()` (0x0201f12c) or the capture
+  path — and this image has no safe home for injected code (see the AWB section: fully packed, no blank
+  space, branch-dense). Injecting a hook into `delay()` for a race that never fires is strictly negative
+  EV, so we leave it. A `ponytail:`-style note: the existing 0x02007b54 skip IS the guard.
+- **Non-wrap-safe timestamps** (0x020079e4, 0x02007ae0, 0x02007b50): absolute unsigned `uptime()` compares
+  misbehave only at the ~49.7-day 32-bit-ms rollover — irrelevant for a battery camera that is power-cycled.
+- **No explicit AE/exposure-valid gate** before the grab — capture is purely time-gated (worked at 250 ms).
+
+## Shipped debug code (Task 4) — inert; one dangerous "knob" withdrawn
+- 45 `BACK_JPCON1=%X`-style debug format strings (flash 0x6d3f4+) feed a JP-register printf dump at
+  0x02030d3c–0x020311b0. That dump is **unreachable dead code**: nothing calls, branches to, or stores a
+  pointer to 0x02030d3c, so it never runs — zero runtime cost, nothing to safely remove (the space is in a
+  packed code sector and cannot host anything executable). The 4 other scattered BACK_JP refs have no direct
+  caller either.
+- CORRECTION: an earlier `docs/KNOBS.md` draft offered a NOP of `0x37414` as "the debug-dump call". WRONG —
+  0x37414 calls 0x02030c48, which **programs JPEG hardware SPRs 0xb18c–0xb1b0 from a config struct** (mtspr,
+  not a printf). NOPing it would corrupt JPEG. The knob has been removed; do not patch 0x37414.
+
+## Other rushed markers (unchanged)
 - Many duplicated/hard-coded settle constants (delay(2000)/delay(1000)/…) scattered across subsystems.
 
 ## Tooling (this repo)

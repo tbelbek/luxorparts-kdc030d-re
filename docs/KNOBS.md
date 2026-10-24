@@ -18,10 +18,14 @@ The print path has TWO tone modes. Confirm which your unit uses by testing.
     scaling; this only RESCALES linearly. A true gamma curve needs code injection (see FINDINGS / stretch).
 - DO NOT touch the 0x8000-cap sites (0x0204ab80/88, 0x0204b0c4/cc) or the shared delay/motor timing.
 
-## Remove shipped debug code
-- `0x37414` (RAM 0x02035014, `l.jal 0x02030c48`): the call to the BACK_JP* JPEG-register debug dump.
-  NOP it (4 bytes) to drop the debug dump from that path:
-  `patch DUMP 0x37414=0x00,0x37415=0x00,0x37416=0x00,0x37417=0x15 WRITE`  (0x15000000 = l.nop)
+## Shipped debug code — nothing to remove (and do NOT NOP 0x37414)
+The firmware carries 45 `BACK_JPCON1=%X`-style debug format strings (flash 0x6d3f4+) and a function that
+printf's the JP registers (0x02030d3c–0x020311b0). That dump function is **unreachable dead code** — no
+call, branch, or stored pointer targets it, so it never executes and costs nothing at runtime; there is no
+safe, worthwhile patch to "remove" it (you cannot reclaim the space for anything executable on this packed
+image). An earlier draft of this file told you to NOP `0x37414` as "the debug dump call" — that was WRONG:
+0x37414 calls 0x02030c48, which **writes JPEG hardware SPRs (0xb18c–0xb1b0) from a config struct**. NOPing
+it would drop essential codec configuration and corrupt JPEG. Do not patch it. (Details in FINDINGS.md.)
 
 ## White balance — fix the warm/orange indoor cast (`awb` command, NOT a `patch` knob)
 The SP0A39 runs factory auto-AWB (firmware never configures it). `awb` repurposes the 5 trailing page-1
