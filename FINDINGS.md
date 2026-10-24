@@ -49,3 +49,25 @@ Detailed reverse-engineering notes behind the tooling. The README is the how-to;
   (runs on a synthetic image with no dump). `tools/or1k_dis.py` + `tools/xref.py`: disassembler + call graph.
 - Safety: full backup first; granule preflight; window-guarded payload; readback verify; recovery off the
   boot path (bad shutter/sound value still boots → 0xDA loader → flashrestore).
+
+## Cameras / sensor (identified)
+- **Two cameras (front + back), both SuperPix SP0A39** VGA CMOS. Confirmed via Espressif's open driver:
+  `SP0A39_SCCB_ADDR 0x21`, `SP0A39_PID 0x0a39` — firmware checks the low ID byte `0x39` (at 0x020489d8).
+  Native 640x480; all larger photo sizes (incl. 9280x5160) are upscales. Integrated auto-AWB.
+- Sensor registers are written 8-bit over SCCB via `sccb_write` (RAM 0x02047a34); the init is INLINE
+  (137 writes, main func 0x02047d44), pages selected by reg 0xfd. Our firmware writes pages 0/1
+  (format/gain/saturation) but does NOT configure page-2 AWB -> the SP0A39 runs its factory auto-AWB.
+  The warm/orange cast under indoor light is that default AWB; correcting it needs ADDED page-2 writes.
+
+## There is NO thermal printer in this unit
+Despite the "instant-print" framing, the firmware has no printer: the menu is Photo / Video (720P/1080P) /
+Audio (MP3) / Music List / Games / settings — no Print mode. The "print"/"Print" strings are Photoshop
+resource metadata embedded in a JPEG asset (`8BIM`, `printOutput`, `cropWhenPrinting`); "head" is an MP3
+decoder error string. No print-head driver, dither, paper/motor code exists. (Thermal-print quality: N/A.)
+
+## JPEG photo quality
+- Still photos use quant **set B** (RAM 0x0206ada4 / flash 0x6d1a4), ~Q45. Confirmed by a real photo's DQT.
+- `jpeg-quality` rewrites set B's 128-byte luma+chroma to an Annex-K table scaled to a chosen quality (Q90
+  flashed). Loader `jpeg_load_tables` @0x0202c788 copies it (zigzag via ZZ @0x0206ae24) into codec SRAM.
+- `docs/key-functions.c` holds hand-decompiled, Codex-verified C for uptime/delay/the shutter-lag gate/
+  sccb_write/jpeg_load_tables.

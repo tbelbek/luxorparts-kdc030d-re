@@ -448,6 +448,32 @@ def flash_edits(backup, edits, confirm, strict=True):
     bot.release()
 
 
+PHOTO_QUANT_OFF = 0x6d1a4     # the photo JPEG quant table (set B @ RAM 0x0206ada4): luma[0:64]+chroma[64:128], natural order
+_STD_L = [16,11,10,16,24,40,51,61,12,12,14,19,26,58,60,55,14,13,16,24,40,57,69,56,14,17,22,29,51,87,80,62,
+          18,22,37,56,68,109,103,77,24,35,55,64,81,104,113,92,49,64,78,87,103,121,120,101,72,92,95,98,112,100,103,99]
+_STD_C = [17,18,24,47,99,99,99,99,18,21,26,66,99,99,99,99,24,26,56,99,99,99,99,99,47,66,99,99,99,99,99,99,
+          99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99]
+
+
+def jpeg_quality(backup_path, q, confirm):
+    # Raise the still-photo JPEG quality by replacing the photo quant table (set B, used by the capture
+    # path) with a standard Annex-K table scaled to quality `q`. Stock is ~Q45; this trades file size for
+    # fewer compression artifacts. One code-region sector (0x6d000); does NOT touch resolution/WB/noise.
+    assert 1 <= q <= 99, 'quality 1..99'
+    backup = open(backup_path, 'rb').read()
+    cur = list(backup[PHOTO_QUANT_OFF:PHOTO_QUANT_OFF + 128])
+    if cur[:8] != [16, 11, 15, 23, 28, 24, 22, 25]:
+        sys.exit(f'quant table @0x{PHOTO_QUANT_OFF:x} is not the known photo set (got {cur[:8]}); refusing')
+    S = 5000 // q if q < 50 else 200 - 2 * q
+    scale = lambda v: max(1, min(255, (v * S + 50) // 100))
+    table = [scale(v) for v in _STD_L] + [scale(v) for v in _STD_C]
+    edits = {PHOTO_QUANT_OFF + i: table[i] for i in range(128) if table[i] != cur[i]}
+    print(f'photo JPEG quant: set B @0x{PHOTO_QUANT_OFF:x} -> quality {q} (Annex-K scaled). {len(edits)} of 128 bytes change.')
+    print(f'  current luma[:8] {cur[:8]} (~Q45)  ->  Q{q} luma[:8] {table[:8]}')
+    print('  NOTE: improves compression artifacts only; resolution (672x384), white balance and noise are separate.')
+    flash_edits(backup, edits, confirm, strict=True)
+
+
 def silence_sounds(backup_path, confirm):
     # Silence the power-on/off jingles (the two longest WAVs) by zeroing their PCM SAMPLES to 0x00
     # (= silence). The player ignores the WAV header length, so zeroing the samples themselves is the
@@ -566,6 +592,12 @@ if __name__ == '__main__':
         bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
         cf = sys.argv[3] if len(sys.argv) > 3 else 'DRY'
         silence_sounds(bpath, cf)
+    elif len(sys.argv) >= 2 and sys.argv[1] == 'jpeg-quality':
+        # jpeg-quality BACKUP [Q=90] [WRITE]   (raise the photo JPEG quant table to quality Q)
+        bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
+        q = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 90
+        cf = 'WRITE' if 'WRITE' in sys.argv[3:] else 'DRY'
+        jpeg_quality(bpath, q, cf)
     elif len(sys.argv) >= 2 and sys.argv[1] == 'diag':
         diag(sys.argv[2] if len(sys.argv) > 2 else 'core')
     elif len(sys.argv) >= 2 and sys.argv[1] == 'stockread':
