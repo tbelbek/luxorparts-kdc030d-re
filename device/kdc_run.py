@@ -214,8 +214,10 @@ def dumpflash(start, total, outpath):
 
 
 MAGIC = 0x52585041
-SECTOR = 0x9000          # the 4KB sector holding the shutter-lag constant
-PATCH_OFF = 0x9f48       # flash offset of `l.addi r18,r24,1000` (word 0x9e5803e8)
+SECTOR = 0x9000          # the 4KB sector holding the shutter-lag constants
+PATCH_OFF = 0x9f48       # `l.addi r18,r24,1000` (0x9e5803e8) — the deadline (main settle)
+PATCH_OFF2 = 0x9f64      # `l.addi r3,r0,1000`   (0x9c6003e8) — the fast-path delay(1000) in the same block
+MANAGED = {PATCH_OFF, PATCH_OFF + 1, PATCH_OFF2, PATCH_OFF2 + 1}   # the only bytes flashpatch ever changes
 JEDEC = bytes([0x5e, 0x40, 0x16])
 
 
@@ -323,15 +325,21 @@ def _granule_preflight(bot):
 
 
 def _build_patched(backup, ticks):
+    # Patch BOTH delay immediates in the capture block to `ticks`:
+    #   0x9f48 `l.addi r18,r24,1000` (0x9e58....) — the main deadline/settle
+    #   0x9f64 `l.addi r3,r0,1000`   (0x9c60....) — the fast-path delay() arg (only hit if setup <5 ticks)
     assert 1 <= ticks <= 32767, 'ticks must be 1..32767 (a positive l.addi immediate; >32767 would be negative)'
     cur = struct.unpack_from('<I', backup, PATCH_OFF)[0]
-    if (cur >> 16) != 0x9e58:
-        sys.exit(f'backup word @0x{PATCH_OFF:x} is 0x{cur:08x}, not l.addi r18,r24,imm (0x9e58xxxx); refusing')
+    cur2 = struct.unpack_from('<I', backup, PATCH_OFF2)[0]
+    if (cur >> 16) != 0x9e58 or (cur & 0xffff) != 1000:
+        sys.exit(f'backup word @0x{PATCH_OFF:x} is 0x{cur:08x}, not `l.addi r18,r24,1000`; refusing')
+    if (cur2 >> 16) != 0x9c60 or (cur2 & 0xffff) != 1000:
+        sys.exit(f'backup word @0x{PATCH_OFF2:x} is 0x{cur2:08x}, not `l.addi r3,r0,1000`; refusing')
     patched = bytearray(backup[SECTOR:SECTOR + 0x1000])
-    struct.pack_into('<I', patched, PATCH_OFF - SECTOR, 0x9e580000 | ticks)
-    diff = [SECTOR + i for i in range(0x1000) if patched[i] != backup[SECTOR + i]]
-    # the change must stay within the two immediate bytes (a value like 1000->1001 changes only one)
-    assert set(diff) <= {0x9f48, 0x9f49}, f'unexpected diff {diff}; refusing'
+    struct.pack_into('<I', patched, PATCH_OFF - SECTOR, (cur & 0xffff0000) | ticks)
+    struct.pack_into('<I', patched, PATCH_OFF2 - SECTOR, (cur2 & 0xffff0000) | ticks)
+    diff = {SECTOR + i for i in range(0x1000) if patched[i] != backup[SECTOR + i]}
+    assert diff <= MANAGED, f'unexpected diff {sorted(hex(x) for x in diff)}; refusing'
     return bytes(patched), cur
 
 
@@ -341,7 +349,7 @@ def flashpatch(backup_path, ticks, confirm):
     assert len(backup) >= 0x10000, 'backup too short (need >=64KB)'
     orig_sector = backup[SECTOR:SECTOR + 0x1000]
     patched, cur = _build_patched(backup, ticks)
-    print(f'patch: flash 0x{PATCH_OFF:x} 0x{cur:08x} -> 0x{0x9e580000 | ticks:08x}  (imm {cur & 0xffff} -> {ticks} ticks); 2 bytes @0x9f48,0x9f49')
+    print(f'patch: delay immediates 0x{PATCH_OFF:x} and 0x{PATCH_OFF2:x}: 1000 -> {ticks} ticks (<=4 bytes in sector 0x{SECTOR:x})')
 
     bot = enter_loader()
     # READ-ONLY phase (also the whole of a dry run): JEDEC + live-sector gate, no flash writes.
@@ -353,11 +361,14 @@ def flashpatch(backup_path, ticks, confirm):
     live = _read_range(cmd, SECTOR, 0x1000)
     if live == patched:
         print('  live sector ALREADY matches the patched image — nothing to do.'); bot.release(); return
-    if live != orig_sector:
-        bad = [SECTOR + i for i in range(0x1000) if live[i] != orig_sector[i]]
-        bot.release(); sys.exit(f'LIVE sector 0x{SECTOR:x} matches NEITHER backup NOR patched ({len(bad)} bytes differ from backup, first {bad[:4]}). '
-                                f'It may be half-written. Run:  flashrestore {backup_path} WRITE  (rewrites this sector from backup). Refusing to patch.')
-    print(f'  live sector 0x{SECTOR:x} matches backup exactly — safe to proceed')
+    # the live sector may already carry a PRIOR delay patch; tolerate differences only in the managed
+    # delay bytes, and require everything else to still match the backup.
+    managed_rel = {o - SECTOR for o in MANAGED}
+    unexpected = [SECTOR + i for i in range(0x1000) if i not in managed_rel and live[i] != orig_sector[i]]
+    if unexpected:
+        bot.release(); sys.exit(f'LIVE sector 0x{SECTOR:x} differs from backup OUTSIDE the delay bytes at '
+                                f'{len(unexpected)} offsets (first {unexpected[:4]}); run flashrestore {backup_path} WRITE first. Refusing.')
+    print(f'  live sector 0x{SECTOR:x} matches backup outside the delay immediates — safe to proceed')
 
     if confirm != 'WRITE':
         print('\nDRY RUN (nothing written — only JEDEC + sector read). Re-run with final arg WRITE to erase+program.')
@@ -369,7 +380,7 @@ def flashpatch(backup_path, ticks, confirm):
     cmd = _upload_payload(bot, (SECTOR, SECTOR + 0x1000))   # re-upload the 0x9000-windowed payload
     print('\n*** WRITING sector 0x9000 (erase + 16 pages + verify) ***')
     _write_sector(cmd, SECTOR, patched)        # guarded to 0x9000; exits with a recovery hint on any failure
-    print('  VERIFY OK: sector matches patched image; only 0x9f48,0x9f49 changed vs backup.')
+    print('  VERIFY OK: sector matches patched image; only the delay immediates (0x9f48/0x9f64) changed.')
     print('  DONE. Power-cycle the camera and test the shutter.')
     bot.release()
 
