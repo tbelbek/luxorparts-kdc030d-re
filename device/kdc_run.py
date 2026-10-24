@@ -353,6 +353,14 @@ def _find_wavs(data):
     return out
 
 
+def unmanaged_diffs(live, backup_sec, managed, sec):
+    """Flash offsets where the live sector differs from the backup sector AND are NOT in `managed`.
+    Empty => the only differences (if any) are bytes this patch owns, so a re-patch is safe. Pure helper
+    so flash_edits and the tests share one definition of the retune guard."""
+    return [sec + k for k in range(len(live))
+            if live[k] != backup_sec[k] and (managed is None or (sec + k) not in managed)]
+
+
 def flash_edits(backup, edits, confirm, strict=True, managed=None):
     # edits: {flash_offset: new_byte}. Rewrite each affected 4KB sector to backup+edits.
     # strict: require the live sector to still match the backup (or already be the target) before writing.
@@ -380,12 +388,11 @@ def flash_edits(backup, edits, confirm, strict=True, managed=None):
         if live == targets[sec]:
             print(f'  sector 0x{sec:x}: already matches target — will skip'); continue
         if strict and live != backup[sec:sec + 0x1000]:
-            bad = [sec + k for k in range(0x1000) if live[k] != backup[sec + k]]
-            outside = [b for b in bad if managed is None or b not in managed]
+            outside = unmanaged_diffs(live, backup[sec:sec + 0x1000], managed, sec)
             if outside:
-                bot.release(); sys.exit(f'live sector 0x{sec:x} differs from backup at {len(bad)} bytes {bad[:4]} '
-                                        f'({len(outside)} OUTSIDE the managed set, e.g. {outside[:4]}); refusing')
-            print(f'  sector 0x{sec:x}: live differs from backup only in {len(bad)} managed byte(s) (prior patch) — re-patching')
+                bot.release(); sys.exit(f'live sector 0x{sec:x} differs from backup at {len(outside)}+ bytes '
+                                        f'OUTSIDE the managed set (e.g. {[hex(x) for x in outside[:4]]}); refusing')
+            print(f'  sector 0x{sec:x}: live differs from backup only in managed byte(s) (prior patch) — re-patching')
         nchg = sum(1 for k in range(0x1000) if live[k] != targets[sec][k])
         todo.append(sec)
         tag = 'matches backup' if live == backup[sec:sec + 0x1000] else 'differs from backup (non-strict)'
@@ -397,6 +404,9 @@ def flash_edits(backup, edits, confirm, strict=True, managed=None):
     _granule_preflight(bot)
     for sec in todo:
         cmd = _upload_payload(bot, (sec, sec + 0x1000))
+        # Re-read right before erase: skip if already the target. The strict/managed gate above validated the
+        # same sector moments earlier; nothing else writes flash while we hold the loader (single exclusive
+        # host session), so the sector cannot have changed between the two reads.
         if _read_range(cmd, sec, 0x1000) == targets[sec]:
             print(f'  sector 0x{sec:x} already patched — skip'); continue
         print(f'  *** WRITING sector 0x{sec:x} ***')
@@ -440,6 +450,12 @@ def jpeg_quality(backup_path, q, confirm):
 # grayscale mode, tune the ramp step at 0x4cb5c instead (see docs/KNOBS.md). A true gamma/error-diffusion
 # dither would need added code, and this packed image has no safe home for injection (see FINDINGS.md).
 PRINT_THRESH_OFF = 0x4d440        # word l.sfgtui r6,128 == 0xbc460080; low-16 imm = the threshold
+PRINT_THRESH_WORD = 0xbc460080
+
+
+def print_tone_edits(threshold):
+    """Pure: the 2-byte edit that sets the fixed-mode print threshold. Shared with the tests."""
+    return {PRINT_THRESH_OFF: threshold & 0xff, PRINT_THRESH_OFF + 1: (threshold >> 8) & 0xff}
 
 
 def print_tone(backup_path, threshold, confirm):
@@ -449,9 +465,9 @@ def print_tone(backup_path, threshold, confirm):
     if len(backup) < (PRINT_THRESH_OFF & ~0xfff) + 0x1000:   # need the whole sector present to rewrite it
         sys.exit('print-tone: backup too short (need the full 0x4d000 sector)')
     w = struct.unpack_from('<I', backup, PRINT_THRESH_OFF)[0]
-    if w != 0xbc460080:              # l.sfgtui r6,128 — refuse on any other image
-        sys.exit(f'print-tone: site @0x{PRINT_THRESH_OFF:x} word {w:08x} != expected bc460080; refusing')
-    edits = {PRINT_THRESH_OFF: threshold & 0xff, PRINT_THRESH_OFF + 1: (threshold >> 8) & 0xff}
+    if w != PRINT_THRESH_WORD:       # l.sfgtui r6,128 — refuse on any other image
+        sys.exit(f'print-tone: site @0x{PRINT_THRESH_OFF:x} word {w:08x} != expected {PRINT_THRESH_WORD:08x}; refusing')
+    edits = print_tone_edits(threshold)
     print(f'print tone: fixed-mode threshold 128 -> {threshold} (0x{threshold:02x}); higher = darker.')
     print(f'  pixel <= threshold prints black (assumes head bit 0x8000 = energized/black — confirm on 1st print).')
     print(f'  retune by re-running; full revert: flashrestore BACKUP 0x4d000 WRITE.')
@@ -512,22 +528,39 @@ AWB_SITES = [
     (0x4b250, 0x9c400056, 0x00fd),   # write5 reg -> 0xfd
     (0x4b260, 0x9c600040, 0x0001),   # write5 val -> 0x01   (0xfd=0x01: restore the original page-1 exit state)
 ]
+AWB_RGAIN_OFF, AWB_BGAIN_OFF = 0x4b22c, 0x4b244          # the two None-immediate (gain-value) sites, R then B
+
+
+def awb_edits(rgain, bgain):
+    """Pure: the {flash_off: byte} AWB edits for a given R/B gain. Shared by awb() and the tests so the
+    thing under test is the real edit builder, not a copy. Both immediate bytes are written so a negative
+    original immediate (0xff80 etc.) becomes the intended positive low-16."""
+    edits = {}
+    for off, _ow, imm in AWB_SITES:
+        v = imm if imm is not None else (rgain if off == AWB_RGAIN_OFF else bgain)
+        edits[off] = v & 0xff; edits[off + 1] = (v >> 8) & 0xff
+    return edits
+
+
+def awb_gate(backup):
+    """Return None if `backup` is exactly this firmware at every AWB site, else a human message. Pure."""
+    if len(backup) < AWB_SECTOR + 0x1000:
+        return 'backup too short'
+    for off, orig_word, _imm in AWB_SITES:
+        live = struct.unpack_from('<I', backup, off)[0]
+        if live != orig_word:
+            return f'flash 0x{off:x} word {live:08x} != expected {orig_word:08x} (not this firmware)'
+    return None
 
 
 def awb(backup_path, rgain, bgain, confirm):
     if not (0 <= rgain <= 0xff and 0 <= bgain <= 0xff):
         sys.exit('AWB: RGAIN and BGAIN must each be 0..255 (0x00..0xff)')
     backup = open(backup_path, 'rb').read()
-    if len(backup) < AWB_SECTOR + 0x1000:
-        sys.exit('AWB: backup too short')
-    for off, orig_word, _imm in AWB_SITES:               # gate: full-word match => refuse on any other image
-        live = struct.unpack_from('<I', backup, off)[0]
-        if live != orig_word:
-            sys.exit(f'AWB gate: flash 0x{off:x} word {live:08x} != expected {orig_word:08x} (not this firmware); refusing')
-    edits = {}
-    for off, _ow, imm in AWB_SITES:
-        v = imm if imm is not None else (rgain if off == 0x4b22c else bgain)
-        edits[off] = v & 0xff; edits[off + 1] = (v >> 8) & 0xff
+    bad = awb_gate(backup)
+    if bad:
+        sys.exit(f'AWB gate: {bad}; refusing')
+    edits = awb_edits(rgain, bgain)
     print('AWB override (repurpose 5 trailing page-1 sensor-init writes; l.addi immediates only -> same')
     print('  operand-patch recovery tier as the shutter patch, reversible; NOT a code/hook injection):')
     print('  page1 0x32=0x05 (auto-AWB OFF) -> page2 0x26(R)=0x%02x 0x27(B)=0x%02x -> restore page 1' % (rgain, bgain))
@@ -563,6 +596,9 @@ def flashrestore(backup_path, confirm, sector=SECTOR):
     # Recovery: rewrite one 4 KiB sector from the backup (no equality gate). Dry-run unless confirm=='WRITE'.
     # Default sector 0x9000 (shutter); pass another to revert a different patch, e.g. 0x4b000 (AWB), 0x6d000
     # (jpeg-quality). Any sector is recoverable this way as long as the device still boots into the loader.
+    # There is intentionally NO equality gate (this is the recovery path), so it trusts `backup`: restoring
+    # sector 0 / the bootstrap from a WRONG backup could brick boot. Only ever run it with THIS unit's own
+    # full 4 MiB backup. The JEDEC probe below still guards against writing a mis-detected chip.
     if sector & 0xfff or not (0 <= sector <= 0x3ff000):
         sys.exit(f'flashrestore: sector 0x{sector:x} must be 4KB-aligned and within 0..0x3ff000')
     backup = open(backup_path, 'rb').read()
