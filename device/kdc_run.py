@@ -425,6 +425,32 @@ def jpeg_quality(backup_path, q, confirm):
     flash_edits(backup, edits, confirm, strict=True)
 
 
+# --- Thermal print tone (fixed-threshold mode) ------------------------------------------------------
+# The fixed-threshold print path prints a BLACK dot when pixel <= threshold (0x0204b03c reads the pixel,
+# 0x0204b040 `l.sfgtui r6,128` tests pixel>threshold -> white, else the head data bit 0x8000 is set = black).
+# So HIGHER threshold = more dots qualify as black = DARKER print (good for a faint thermal print); LOWER =
+# lighter. This is a single l.sfgtui immediate -> operand-only in-place patch (safe/reversible, same tier as
+# the shutter patch). It only affects the fixed-threshold tone mode; if your unit prints in the 32-plane
+# grayscale mode, tune the ramp step at 0x4cb5c instead (see docs/KNOBS.md). A true gamma/error-diffusion
+# dither would need added code, and this packed image has no safe home for injection (see FINDINGS.md).
+PRINT_THRESH_OFF = 0x4d440        # word l.sfgtui r6,128 == 0xbc460080; low-16 imm = the threshold
+
+
+def print_tone(backup_path, threshold, confirm):
+    if not (1 <= threshold <= 254):
+        sys.exit('print-tone: threshold must be 1..254 (higher = darker)')
+    backup = open(backup_path, 'rb').read()
+    if len(backup) < PRINT_THRESH_OFF + 4:
+        sys.exit('print-tone: backup too short')
+    w = struct.unpack_from('<I', backup, PRINT_THRESH_OFF)[0]
+    if w != 0xbc460080:              # l.sfgtui r6,128 — refuse on any other image
+        sys.exit(f'print-tone: site @0x{PRINT_THRESH_OFF:x} word {w:08x} != expected bc460080; refusing')
+    edits = {PRINT_THRESH_OFF: threshold & 0xff, PRINT_THRESH_OFF + 1: (threshold >> 8) & 0xff}
+    print(f'print tone: fixed-mode threshold 128 -> {threshold} (0x{threshold:02x}); higher = darker.')
+    print(f'  pixel <= threshold prints black. Revert/retune: re-run, or flashrestore BACKUP 0x4d000 WRITE.')
+    flash_edits(backup, edits, confirm, strict=False)   # re-tunable: target is deterministic from the clean backup
+
+
 def patch_bytes(backup_path, spec, confirm):
     # Generic value-patcher: spec = "0xFLASHOFF=0xVAL,0xFLASHOFF=0xVAL,..." (little tunable knobs).
     # Each sector is rewritten from backup+edits (strict: live must still match backup). See docs/KNOBS.md.
@@ -624,6 +650,13 @@ if __name__ == '__main__':
         bpath = sys.argv[2]; spec = sys.argv[3]
         cf = 'WRITE' if 'WRITE' in sys.argv[4:] else 'DRY'
         patch_bytes(bpath, spec, cf)
+    elif len(sys.argv) >= 2 and sys.argv[1] == 'print-tone':
+        # print-tone BACKUP [THRESHOLD=0x90] [WRITE]   (fixed-mode print darkness; higher = darker)
+        bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
+        nums = [int(x, 0) for x in sys.argv[3:] if x != 'WRITE']
+        th = nums[0] if nums else 0x90
+        cf = 'WRITE' if sys.argv[-1] == 'WRITE' else 'DRY'
+        print_tone(bpath, th, cf)
     elif len(sys.argv) >= 2 and sys.argv[1] == 'jpeg-quality':
         # jpeg-quality BACKUP [Q=90] [WRITE]   (raise the photo JPEG quant table to quality Q)
         bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
@@ -639,5 +672,5 @@ if __name__ == '__main__':
         marker()
     else:
         sys.exit('usage: kdc_run.py dump START LEN [out] | flasher [addr] [len] | flashpatch | '
-                 'flashrestore [SECTOR] | silence-sounds | patch | jpeg-quality | awb [R B] | '
-                 'stockread | bootrom | marker')
+                 'flashrestore [SECTOR] | silence-sounds | patch | jpeg-quality | print-tone [T] | '
+                 'awb [R B] | stockread | bootrom | marker')

@@ -33,17 +33,17 @@ Detailed reverse-engineering notes behind the tooling. The README is the how-to;
   above. The other ~53 are boot / SD / display / audio settle times (off the photo path) — necessary
   hardware timing, NOT safe to shorten.
 
-## Robustness guards (Task 5) — analysed, deliberately NOT patched
-- **Unsigned underflow** in the settle: the deadline is checked at 0x02007b4c–54 but the subtraction
-  sample is taken later at 0x02007b70; if time crosses the deadline between them, `deadline - now`
-  underflows to a huge unsigned `delay()` argument. BUT it is **already mitigated**: the branch at
-  0x02007b54 (`l.bf` when `now > deadline`) skips the whole settle, so the underflow can only occur in the
-  ~4-instruction re-sample window between 0x02007b5c and 0x02007b70 — a nanosecond race that essentially
-  never fires, and whose worst case is a one-time hang cured by a power-cycle (not a brick). A true guard
-  would require a clamp, i.e. CODE INJECTION into the hottest shared `delay()` (0x0201f12c) or the capture
-  path — and this image has no safe home for injected code (see the AWB section: fully packed, no blank
-  space, branch-dense). Injecting a hook into `delay()` for a race that never fires is strictly negative
-  EV, so we leave it. A `ponytail:`-style note: the existing 0x02007b54 skip IS the guard.
+## Robustness guards (Task 5) — PROVEN unnecessary (no safe guard adds value)
+- **The feared settle underflow is benign — it cannot hang.** The settle computes `delay(deadline - now)`;
+  if `now` has passed the deadline (the narrow re-sample race at 0x02007b5c–70, already partly guarded by
+  the skip-branch at 0x02007b54), the argument underflows to a huge unsigned value ~0xFFFFFFxx. But trace
+  `delay(ms)` (0x0201f12c): `target = start + ms` (mod 2^32), then `while sfltu(TICKS, target)`. A huge ms
+  WRAPS `target` to just below `start`, so `TICKS < target` is immediately false and **delay returns at
+  once** — not a 49-day hang, not even a stall. In the normal path `deadline - now` is always ≤ the 250-tick
+  settle, so the delay is already bounded. There is therefore **nothing to clamp**: the only non-bounded
+  input self-corrects to an instant return. Verified against the delay() disassembly.
+  (An in-place "force the fast path" patch at 0x02007b68 was considered and REJECTED: it would always wait a
+  fixed 250 ticks instead of the computed remainder, regressing the very shutter lag we reduced.)
 - **Non-wrap-safe timestamps** (0x020079e4, 0x02007ae0, 0x02007b50): absolute unsigned `uptime()` compares
   misbehave only at the ~49.7-day 32-bit-ms rollover — irrelevant for a battery camera that is power-cycled.
 - **No explicit AE/exposure-valid gate** before the grab — capture is purely time-gated (worked at 250 ms).

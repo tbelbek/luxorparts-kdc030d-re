@@ -7,15 +7,24 @@ Each is a safe, reversible byte patch inside the loaded app. Dry-run first, add 
 sudo venv/bin/python device/kdc_run.py patch YOUR-4MB-DUMP.bin 0xOFF=0xVAL[,0xOFF=0xVAL...] [WRITE]
 ```
 
-## Thermal print (printer IS present: 58 mm, 384 dots/line, ink-free thermal)
-The print path has TWO tone modes. Confirm which your unit uses by testing.
-- **Fixed-threshold mode** — one global threshold at 128 decides black/white per dot (harsh, no midtones).
-  - `0x4d440` (RAM 0x0204b040, `l.sfgtui r6,128`): the threshold. **Lower = darker / more highlight detail,
-    higher = lighter.** Codex suggests **144 (0x90)** to recover midtones. `patch DUMP 0x4d440=0x90 WRITE`
-- **32-plane grayscale mode** — prints each line in 32 passes with ascending thresholds 0,8,16,…,248
-  (a linear tone ramp). This is the real grayscale path.
-  - `0x4cb5c` (RAM 0x0204a75c, `l.addi r2,r2,8`): the threshold STEP (8). Smaller step = finer/lighter ramp
-    scaling; this only RESCALES linearly. A true gamma curve needs code injection (see FINDINGS / stretch).
+## Thermal print tone (printer IS present: 58 mm, 384 dots/line, ink-free thermal)
+The print path has TWO tone modes. Confirm which your unit uses by testing (print a photo and see whether it
+is 1-bit harsh or has grey shading).
+- **Fixed-threshold mode** — one global threshold decides black/white per dot. A pixel prints BLACK when
+  `pixel <= threshold`, so **higher threshold = more black = DARKER; lower = lighter.** Dedicated command:
+  ```bash
+  sudo venv/bin/python device/kdc_run.py print-tone YOUR-4MB-DUMP.bin [THRESHOLD] WRITE   # default 0x90
+  ```
+  Default 0x90 (144, slightly darker than stock 128) recovers faint midtones; raise toward 0xb0 for a darker
+  print, lower toward 0x60 for lighter. Re-tunable (rewrites from the clean backup). Revert:
+  `flashrestore DUMP 0x4d000 WRITE`. (Offset 0x4d440, `l.sfgtui r6,128` — operand-only, safe tier.)
+- **32-plane grayscale mode** — prints each line in 32 passes with ascending thresholds 0,8,16,…,248 (a
+  linear tone ramp built on the stack). The real grayscale path, but the ramp is COMPUTED, not a table.
+  - `0x4cb5c` (RAM 0x0204a75c, `l.addi r2,r2,8`): the ramp STEP (8). Smaller step = the ramp tops out sooner
+    (compresses toward lighter); this only RESCALES LINEARLY. `patch DUMP 0x4cb5c=0x06 WRITE` for a trial.
+  - A true GAMMA curve or error-diffusion DITHER (the ideal for photos on a 1-bit head) needs a non-linear
+    LUT = added code; this packed image has no safe home for injection (see FINDINGS.md), so it is NOT
+    flashable — the threshold/step knobs are the safe, flashable reach.
 - DO NOT touch the 0x8000-cap sites (0x0204ab80/88, 0x0204b0c4/cc) or the shared delay/motor timing.
 
 ## Shipped debug code — nothing to remove (and do NOT NOP 0x37414)
