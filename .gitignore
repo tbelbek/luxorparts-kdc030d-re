@@ -1,7 +1,6 @@
 # vendor firmware / BootROM dumps — not ours to redistribute
 *.bin
 !tools/stub_marker.bin
-!tools/stub_reader.bin
 our_bootrom.bin
 refs/
 venv/
