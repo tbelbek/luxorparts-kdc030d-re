@@ -29,11 +29,13 @@ sudo venv/bin/python device/kdc_run.py jpeg-quality full_backup_4mb.bin 90 WRITE
 
 ## 2. The two EXPERIMENTAL, tune-on-device patches (confirm direction on the first shot/print, then iterate)
 ```bash
-# White balance: kill the orange indoor cast. Default R=0x88 B=0xd0 (cool). Lower R / raise B = cooler.
-sudo venv/bin/python device/kdc_run.py awb full_backup_4mb.bin 0x88 0xd0            # dry-run
-sudo venv/bin/python device/kdc_run.py awb full_backup_4mb.bin 0x88 0xd0 WRITE      # commit, shoot indoors
-#   too warm still -> lower R toward 0x78 and/or raise B toward 0xe0, re-run (it retunes from the backup):
-sudo venv/bin/python device/kdc_run.py awb full_backup_4mb.bin 0x78 0xe0 WRITE
+# White balance (+ optional brightness): kill the orange cast; add a 3rd number = AE indoor target to also
+# brighten dim indoor shots (stock ~0x38, higher=brighter). Default R=0x88 B=0xd0 (cool).
+sudo venv/bin/python device/kdc_run.py awb full_backup_4mb.bin 0x88 0xd0 0x48        # dry-run (WB + brightness)
+sudo venv/bin/python device/kdc_run.py awb full_backup_4mb.bin 0x88 0xd0 0x48 WRITE  # commit, shoot indoors
+#   too warm -> lower R toward 0x78 / raise B toward 0xe0; too dark/bright -> adjust the 3rd number (AE),
+#   e.g. 0x45 dimmer .. 0x50 brighter. Re-run with the new values (it retunes from the backup). Omit the 3rd
+#   number to leave exposure untouched (but if you already flashed AE, keep passing it or flashrestore first).
 #   WB is now FIXED (auto-AWB off): great indoors, may look cool in daylight. After a resolution/mode
 #   change, recheck WB (a RAM reg-table replay may re-touch the sensor).
 

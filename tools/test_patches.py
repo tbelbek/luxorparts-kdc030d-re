@@ -94,7 +94,16 @@ def test_awb_gate_and_sequence():
         want_lo = imm if imm is not None else (0x88 if off == R.AWB_RGAIN_OFF else 0xd0)
         got = struct.unpack_from('<I', b, off)[0]
         assert got >> 16 == ow >> 16 and (got >> 26) == 0x27 and (got & 0xffff) == want_lo, f'@0x{off:x} {got:08x}'
-    print('  [ok] awb_gate accepts/rejects; patched init emits the exact 5-write AWB sequence; operands-only')
+    # optional AE-target: with ae set, an extra 0xcb=<ae> write appears on page 1 BEFORE the AWB sequence
+    assert R.awb_gate(d, include_ae=True) is None
+    ba = apply(R.awb_edits(0x88, 0xd0, ae=0x48))
+    assert sccb_seq(ba, 0x02048d80, 0x02048e80)[-6:] == [
+        (0xcb, 0x48), (0x32, 0x05), (0xfd, 0x02), (0x26, 0x88), (0x27, 0xd0), (0xfd, 0x01)]
+    for off, ow, imm in R.AE_SITES:                 # operands-only at the AE sites too
+        got = struct.unpack_from('<I', ba, off)[0]
+        assert got >> 16 == ow >> 16 and (got >> 26) == 0x27
+    assert 0x4b1d4 not in R.awb_edits(0x88, 0xd0)   # ae=None leaves the original 0xb4 write intact
+    print('  [ok] awb_gate accepts/rejects; 5-write AWB sequence; operands-only; +0xcb AE-target when ae set')
 
 
 def test_print_tone_real():

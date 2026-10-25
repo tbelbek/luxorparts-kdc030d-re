@@ -570,45 +570,69 @@ AWB_SITES = [
     (0x4b260, 0x9c600040, 0x0001),   # write5 val -> 0x01   (0xfd=0x01: restore the original page-1 exit state)
 ]
 AWB_RGAIN_OFF, AWB_BGAIN_OFF = 0x4b22c, 0x4b244          # the two None-immediate (gain-value) sites, R then B
+# OPTIONAL AE-target brightness (improvement #1). The firmware never writes the AE target register, so we
+# add it the same safe way: repurpose the page-1 write immediately BEFORE the AWB run — call 0x02048df8,
+# originally 0xb4=0x0f (a saturation point; the OTHER 0xb4 write is already repurposed by AWB) — into
+# 0xcb=<target>. 0xcb is the SP0A39 AE indoor-target register (page 1; stock power-on ~0x38); HIGHER =
+# brighter indoor exposure. It runs on page 1 before the AWB page-2 switch, so the page is correct. AE is
+# delivered THROUGH the awb command because both are page-1 tweaks in the same flash sector 0x4b000 and two
+# separate commands would each rebuild that sector from the clean backup and clobber the other.
+AE_SITES = [
+    (0x4b1d4, 0x9c40ffb4, 0x00cb),   # reg -> 0xcb (AE indoor target, page 1)
+    (0x4b1e8, 0x9c60000f, None),     # val -> AE target arg (higher = brighter)
+]
+AE_VAL_OFF = 0x4b1e8
 
 
-def awb_edits(rgain, bgain):
-    """Pure: the {flash_off: byte} AWB edits for a given R/B gain. Shared by awb() and the tests so the
-    thing under test is the real edit builder, not a copy. Both immediate bytes are written so a negative
-    original immediate (0xff80 etc.) becomes the intended positive low-16."""
+def awb_edits(rgain, bgain, ae=None):
+    """Pure: the {flash_off: byte} AWB edits for a given R/B gain, plus the AE-target edit when ae is set.
+    Shared by awb() and the tests so the thing under test is the real edit builder, not a copy. Both
+    immediate bytes are written so a negative original immediate (0xff80 etc.) becomes the intended low-16."""
     edits = {}
-    for off, _ow, imm in AWB_SITES:
-        v = imm if imm is not None else (rgain if off == AWB_RGAIN_OFF else bgain)
+    sites = AWB_SITES + (AE_SITES if ae is not None else [])
+    for off, _ow, imm in sites:
+        if imm is not None:
+            v = imm
+        elif off == AWB_RGAIN_OFF:
+            v = rgain
+        elif off == AWB_BGAIN_OFF:
+            v = bgain
+        else:                        # AE_VAL_OFF
+            v = ae
         edits[off] = v & 0xff; edits[off + 1] = (v >> 8) & 0xff
     return edits
 
 
-def awb_gate(backup):
-    """Return None if `backup` is exactly this firmware at every AWB site, else a human message. Pure."""
+def awb_gate(backup, include_ae=False):
+    """Return None if `backup` is exactly this firmware at every site we'll patch, else a human message."""
     if len(backup) < AWB_SECTOR + 0x1000:
         return 'backup too short'
-    for off, orig_word, _imm in AWB_SITES:
+    for off, orig_word, _imm in AWB_SITES + (AE_SITES if include_ae else []):
         live = struct.unpack_from('<I', backup, off)[0]
         if live != orig_word:
             return f'flash 0x{off:x} word {live:08x} != expected {orig_word:08x} (not this firmware)'
     return None
 
 
-def awb(backup_path, rgain, bgain, confirm):
+def awb(backup_path, rgain, bgain, confirm, ae=None):
     if not (0 <= rgain <= 0xff and 0 <= bgain <= 0xff):
         sys.exit('AWB: RGAIN and BGAIN must each be 0..255 (0x00..0xff)')
+    if ae is not None and not (1 <= ae <= 0xff):
+        sys.exit('AWB: AE target must be 1..255 (stock ~0x38; higher = brighter)')
     backup = open(backup_path, 'rb').read()
-    bad = awb_gate(backup)
+    bad = awb_gate(backup, include_ae=ae is not None)
     if bad:
         sys.exit(f'AWB gate: {bad}; refusing')
-    edits = awb_edits(rgain, bgain)
-    print('AWB override (repurpose 5 trailing page-1 sensor-init writes; l.addi immediates only -> same')
+    edits = awb_edits(rgain, bgain, ae)
+    print('AWB override (repurpose trailing page-1 sensor-init writes; l.addi immediates only -> same')
     print('  operand-patch recovery tier as the shutter patch, reversible; NOT a code/hook injection):')
     print('  page1 0x32=0x05 (auto-AWB OFF) -> page2 0x26(R)=0x%02x 0x27(B)=0x%02x -> restore page 1' % (rgain, bgain))
+    if ae is not None:
+        print('  + AE indoor target 0xcb = 0x%02x (stock ~0x38; higher = brighter indoor exposure)' % ae)
     print('  0x80=1.0x gain; lower R / higher B cools the warm cast.')
-    print(f'  retune: re-run with new R/B (rewrites from this clean backup; only our own bytes may differ live).')
+    print(f'  retune: re-run with new values (rewrites from this clean backup; only our own bytes may differ live).')
     print(f'  {len(edits)} immediate bytes in sector 0x{AWB_SECTOR:x}. Full revert: flashrestore BACKUP 0x{AWB_SECTOR:x} WRITE')
-    # strict + managed: a prior awb run (our own bytes) is allowed to be re-patched, but any OTHER unexpected
+    # strict + managed: a prior run (our own bytes) is allowed to be re-patched, but any OTHER unexpected
     # change in the sector still refuses — so retune works without blindly overwriting a tampered sector.
     flash_edits(backup, edits, confirm, strict=True, managed=set(edits.keys()))
 
@@ -727,8 +751,9 @@ if __name__ == '__main__':
         nums = [int(x, 0) for x in sys.argv[3:] if x != 'WRITE']
         rg = nums[0] if len(nums) > 0 else 0x88
         bg = nums[1] if len(nums) > 1 else 0xd0
+        ae = nums[2] if len(nums) > 2 else None     # optional 3rd number = AE indoor target (brightness)
         cf = 'WRITE' if sys.argv[-1] == 'WRITE' else 'DRY'   # WRITE must be the literal LAST arg
-        awb(bpath, rg, bg, cf)
+        awb(bpath, rg, bg, cf, ae)
     elif len(sys.argv) >= 2 and sys.argv[1] == 'silence-sounds':
         # silence-sounds BACKUP [WRITE]   (zero the 2 longest WAVs' size fields; dry run unless WRITE)
         bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
@@ -762,4 +787,4 @@ if __name__ == '__main__':
     else:
         sys.exit('usage: kdc_run.py dump START LEN [out] | flasher [addr] [len] | flashpatch [TICKS] [GUARD] | '
                  'flashrestore [SECTOR] | silence-sounds | patch | jpeg-quality | print-tone [T] | '
-                 'awb [R B] | stockread | bootrom | marker')
+                 'awb [R B [AE]] | stockread | bootrom | marker')

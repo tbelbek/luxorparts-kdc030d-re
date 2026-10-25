@@ -16,7 +16,7 @@ which carries inline labels and verbatim confirms our AWB map; siblings SP0A20/S
 
 ## Ranked opportunities
 
-### 1. Indoor brightness — AE target  ★ highest image payoff
+### 1. Indoor brightness — AE target  ★ highest image payoff  — ✅ SHIPPED (optional `awb … AE`)
 The cleanest brightness knob on this sensor is the **auto-exposure target**: page-1 `0xcb` (indoor target,
 stock ~0x38) and `0xcc` (outdoor). Raising it brightens dim indoor shots (a classic cheap-kids-camera
 complaint). The firmware does NOT write 0xcb/0xcc today, so deliver it the AWB way: repurpose a short run of
