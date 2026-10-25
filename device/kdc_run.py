@@ -582,51 +582,66 @@ AE_SITES = [
     (0x4b1e8, 0x9c60000f, None),     # val -> AE target arg (higher = brighter)
 ]
 AE_VAL_OFF = 0x4b1e8
+# OPTIONAL low-light max-gain ceiling (improvement #2). Not written by the firmware, so repurpose the
+# page-1 write just before AE's (call 0x02048dd8, originally 0x67=0x60) into 0x04=<maxgain>. 0x04 is the
+# SP0A39 page-1 AE indoor max-gain (rpc_max_indoor; stock power-on ~0xff = max). LOWER = less low-light
+# grain but darker low-light; pairs with AE target (#1) — a brighter target with a capped gain pushes the
+# AE toward longer exposure (cleaner, more motion blur) instead of gain (noisier). Page 1 at dd8, before AE
+# and the AWB page-2 switch. Same sector 0x4b000 / same safe tier. NOTE the cumulative sacrifice: AWB(5) +
+# AE(1) + maxgain(1) = 7 trailing page-1 writes repurposed — apply incrementally and bench-test each step.
+MAXGAIN_SITES = [
+    (0x4b1bc, 0x9c400067, 0x0004),   # reg -> 0x04 (AE indoor max-gain, page 1)
+    (0x4b1c4, 0x9c600060, None),     # val -> max-gain arg (lower = less noise/darker)
+]
+MAXGAIN_VAL_OFF = 0x4b1c4
 
 
-def awb_edits(rgain, bgain, ae=None):
-    """Pure: the {flash_off: byte} AWB edits for a given R/B gain, plus the AE-target edit when ae is set.
-    Shared by awb() and the tests so the thing under test is the real edit builder, not a copy. Both
-    immediate bytes are written so a negative original immediate (0xff80 etc.) becomes the intended low-16."""
+def awb_edits(rgain, bgain, ae=None, maxgain=None):
+    """Pure: the {flash_off: byte} edits for the AWB override, plus the AE-target edit when `ae` is set and
+    the max-gain edit when `maxgain` is set. Shared by awb() and the tests so the thing under test is the
+    real builder. Both immediate bytes are written so a negative original immediate becomes the low-16."""
+    valmap = {AWB_RGAIN_OFF: rgain, AWB_BGAIN_OFF: bgain, AE_VAL_OFF: ae, MAXGAIN_VAL_OFF: maxgain}
+    sites = list(AWB_SITES)
+    if ae is not None: sites += AE_SITES
+    if maxgain is not None: sites += MAXGAIN_SITES
     edits = {}
-    sites = AWB_SITES + (AE_SITES if ae is not None else [])
     for off, _ow, imm in sites:
-        if imm is not None:
-            v = imm
-        elif off == AWB_RGAIN_OFF:
-            v = rgain
-        elif off == AWB_BGAIN_OFF:
-            v = bgain
-        else:                        # AE_VAL_OFF
-            v = ae
+        v = imm if imm is not None else valmap[off]
         edits[off] = v & 0xff; edits[off + 1] = (v >> 8) & 0xff
     return edits
 
 
-def awb_gate(backup, include_ae=False):
+def awb_gate(backup, include_ae=False, include_maxgain=False):
     """Return None if `backup` is exactly this firmware at every site we'll patch, else a human message."""
     if len(backup) < AWB_SECTOR + 0x1000:
         return 'backup too short'
-    for off, orig_word, _imm in AWB_SITES + (AE_SITES if include_ae else []):
+    sites = list(AWB_SITES)
+    if include_ae: sites += AE_SITES
+    if include_maxgain: sites += MAXGAIN_SITES
+    for off, orig_word, _imm in sites:
         live = struct.unpack_from('<I', backup, off)[0]
         if live != orig_word:
             return f'flash 0x{off:x} word {live:08x} != expected {orig_word:08x} (not this firmware)'
     return None
 
 
-def awb(backup_path, rgain, bgain, confirm, ae=None):
+def awb(backup_path, rgain, bgain, confirm, ae=None, maxgain=None):
     if not (0 <= rgain <= 0xff and 0 <= bgain <= 0xff):
         sys.exit('AWB: RGAIN and BGAIN must each be 0..255 (0x00..0xff)')
     if ae is not None and not (1 <= ae <= 0xff):
         sys.exit('AWB: AE target must be 1..255 (stock ~0x38; higher = brighter)')
+    if maxgain is not None and not (1 <= maxgain <= 0xff):
+        sys.exit('AWB: max-gain must be 1..255 (stock ~0xff; lower = less low-light noise/darker)')
     backup = open(backup_path, 'rb').read()
-    bad = awb_gate(backup, include_ae=ae is not None)
+    bad = awb_gate(backup, include_ae=ae is not None, include_maxgain=maxgain is not None)
     if bad:
         sys.exit(f'AWB gate: {bad}; refusing')
-    edits = awb_edits(rgain, bgain, ae)
+    edits = awb_edits(rgain, bgain, ae, maxgain)
     print('AWB override (repurpose trailing page-1 sensor-init writes; l.addi immediates only -> same')
     print('  operand-patch recovery tier as the shutter patch, reversible; NOT a code/hook injection):')
     print('  page1 0x32=0x05 (auto-AWB OFF) -> page2 0x26(R)=0x%02x 0x27(B)=0x%02x -> restore page 1' % (rgain, bgain))
+    if maxgain is not None:
+        print('  + AE max-gain 0x04 = 0x%02x (stock ~0xff; lower = less low-light noise but darker)' % maxgain)
     if ae is not None:
         print('  + AE indoor target 0xcb = 0x%02x (stock ~0x38; higher = brighter indoor exposure)' % ae)
     print('  0x80=1.0x gain; lower R / higher B cools the warm cast.')
@@ -752,8 +767,9 @@ if __name__ == '__main__':
         rg = nums[0] if len(nums) > 0 else 0x88
         bg = nums[1] if len(nums) > 1 else 0xd0
         ae = nums[2] if len(nums) > 2 else None     # optional 3rd number = AE indoor target (brightness)
+        mg = nums[3] if len(nums) > 3 else None     # optional 4th number = AE indoor max-gain (low-light)
         cf = 'WRITE' if sys.argv[-1] == 'WRITE' else 'DRY'   # WRITE must be the literal LAST arg
-        awb(bpath, rg, bg, cf, ae)
+        awb(bpath, rg, bg, cf, ae, mg)
     elif len(sys.argv) >= 2 and sys.argv[1] == 'silence-sounds':
         # silence-sounds BACKUP [WRITE]   (zero the 2 longest WAVs' size fields; dry run unless WRITE)
         bpath = sys.argv[2] if len(sys.argv) > 2 else str(HERE / 'full_backup_4mb.bin')
@@ -787,4 +803,4 @@ if __name__ == '__main__':
     else:
         sys.exit('usage: kdc_run.py dump START LEN [out] | flasher [addr] [len] | flashpatch [TICKS] [GUARD] | '
                  'flashrestore [SECTOR] | silence-sounds | patch | jpeg-quality | print-tone [T] | '
-                 'awb [R B [AE]] | stockread | bootrom | marker')
+                 'awb [R B [AE [MAXGAIN]]] | stockread | bootrom | marker')

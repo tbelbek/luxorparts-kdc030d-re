@@ -25,7 +25,7 @@ repurpose (like AWB). Value: high. Confidence: register CONFIRMED-labeled in the
 target value is tune-on-device. Risk: medium (needs a page-1 write budget + verify nothing later resets AE).**
 Source: esp sp0a39 header AE block (`rpc_target` 0xcb/0xcc).
 
-### 2. Low-light brightness vs noise — AE max-gain ceiling
+### 2. Low-light brightness vs noise — AE max-gain ceiling  — ✅ SHIPPED (optional `awb … AE MAXGAIN`)
 Page-1 `0x04` (indoor max gain, ~0xff) / `0x0a` (outdoor, ~0x30) cap sensor gain — the classic brightness/
 noise trade. Lowering them cuts low-light grain (at the cost of darker/longer exposure); raising brightens
 noisier. Pair with `0x06` (max exposure) for the brightness-vs-motion-blur trade. Not written today →

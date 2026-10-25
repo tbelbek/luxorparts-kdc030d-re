@@ -103,7 +103,16 @@ def test_awb_gate_and_sequence():
         got = struct.unpack_from('<I', ba, off)[0]
         assert got >> 16 == ow >> 16 and (got >> 26) == 0x27
     assert 0x4b1d4 not in R.awb_edits(0x88, 0xd0)   # ae=None leaves the original 0xb4 write intact
-    print('  [ok] awb_gate accepts/rejects; 5-write AWB sequence; operands-only; +0xcb AE-target when ae set')
+    # optional max-gain: with maxgain set, a 0x04=<mg> write precedes the AE+AWB writes (page 1)
+    assert R.awb_gate(d, include_ae=True, include_maxgain=True) is None
+    bm = apply(R.awb_edits(0x88, 0xd0, ae=0x48, maxgain=0x90))
+    assert sccb_seq(bm, 0x02048d80, 0x02048e80)[-7:] == [
+        (0x04, 0x90), (0xcb, 0x48), (0x32, 0x05), (0xfd, 0x02), (0x26, 0x88), (0x27, 0xd0), (0xfd, 0x01)]
+    for off, ow, imm in R.MAXGAIN_SITES:
+        got = struct.unpack_from('<I', bm, off)[0]
+        assert got >> 16 == ow >> 16 and (got >> 26) == 0x27
+    assert 0x4b1bc not in R.awb_edits(0x88, 0xd0, ae=0x48)   # maxgain=None leaves the original 0x67 write intact
+    print('  [ok] awb_gate accepts/rejects; AWB seq; operands-only; +0xcb AE-target; +0x04 max-gain when set')
 
 
 def test_print_tone_real():

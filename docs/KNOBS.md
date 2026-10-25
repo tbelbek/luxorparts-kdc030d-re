@@ -47,7 +47,7 @@ sensor-init writes IN PLACE (l.addi immediate operand bytes only — same revers
 tier as the shutter patch) into: page1 `0x32=0x05` (auto-AWB OFF) → page2 `0x26`=R-gain, `0x27`=B-gain →
 page1 restore. `0x80`=1.0x; **lower R / higher B cools the orange.**
 ```bash
-sudo venv/bin/python device/kdc_run.py awb YOUR-4MB-DUMP.bin [RGAIN BGAIN [AE]] WRITE   # defaults 0x88 0xd0
+sudo venv/bin/python device/kdc_run.py awb YOUR-4MB-DUMP.bin [RGAIN BGAIN [AE [MAXGAIN]]] WRITE  # def 0x88 0xd0
 ```
 - Dry-run first (omit `WRITE`). Retune by re-running with new values (it rewrites the sector from the clean
   backup each time — always pass the ORIGINAL dump). Full revert: `flashrestore DUMP 0x4b000 WRITE`.
@@ -55,9 +55,16 @@ sudo venv/bin/python device/kdc_run.py awb YOUR-4MB-DUMP.bin [RGAIN BGAIN [AE]] 
   fluorescent `0xbf 0xcc`, neutral `0xac 0xad`. Tune on device.
 - **Optional 3rd number = AE indoor-target brightness** (improvement #1): e.g. `awb DUMP 0x88 0xd0 0x48 WRITE`
   also repurposes the page-1 write just before the AWB run into `0xcb=<AE>` (SP0A39 AE indoor target; stock
-  power-on ~0x38, **higher = brighter** dim-indoor shots). It is delivered through `awb` because both are
-  page-1 tweaks in the SAME flash sector 0x4b000 (two separate commands would clobber each other). Try
-  0x45–0x50 first; too bright/washed → lower. Omit it to leave exposure untouched.
+  power-on ~0x38, **higher = brighter** dim-indoor shots). Try 0x45–0x50 first; too bright/washed → lower.
+- **Optional 4th number = AE max-gain ceiling** (improvement #2): e.g. `awb DUMP 0x88 0xd0 0x48 0x90 WRITE`
+  also sets page-1 `0x04=<MAXGAIN>` (SP0A39 indoor max-gain; stock ~0xff, **lower = less low-light grain but
+  darker**). Pairs with #1: a brighter target + capped gain pushes the AE toward exposure over gain (cleaner,
+  more motion blur). Try 0xa0–0xc0 for a mild noise cut.
+- These AE knobs are delivered THROUGH `awb` because all are page-1 tweaks in the SAME flash sector 0x4b000
+  (separate commands would each rebuild the sector from the clean backup and clobber each other). Omit a
+  number to leave that knob untouched. **Cumulative sacrifice:** full `R B AE MAXGAIN` repurposes 7 trailing
+  page-1 init writes — apply incrementally (WB first, then +AE, then +MAXGAIN), bench-testing each; revert any
+  with `flashrestore DUMP 0x4b000 WRITE`.
 - WATCH: auto-AWB is now OFF so WB is FIXED — great indoors, may look cool in daylight. After a
   resolution/mode change the firmware replays a RAM sensor table that could re-touch WB/AE; recheck.
 

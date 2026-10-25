@@ -29,13 +29,15 @@ sudo venv/bin/python device/kdc_run.py jpeg-quality full_backup_4mb.bin 90 WRITE
 
 ## 2. The two EXPERIMENTAL, tune-on-device patches (confirm direction on the first shot/print, then iterate)
 ```bash
-# White balance (+ optional brightness): kill the orange cast; add a 3rd number = AE indoor target to also
-# brighten dim indoor shots (stock ~0x38, higher=brighter). Default R=0x88 B=0xd0 (cool).
-sudo venv/bin/python device/kdc_run.py awb full_backup_4mb.bin 0x88 0xd0 0x48        # dry-run (WB + brightness)
-sudo venv/bin/python device/kdc_run.py awb full_backup_4mb.bin 0x88 0xd0 0x48 WRITE  # commit, shoot indoors
-#   too warm -> lower R toward 0x78 / raise B toward 0xe0; too dark/bright -> adjust the 3rd number (AE),
-#   e.g. 0x45 dimmer .. 0x50 brighter. Re-run with the new values (it retunes from the backup). Omit the 3rd
-#   number to leave exposure untouched (but if you already flashed AE, keep passing it or flashrestore first).
+# White balance (+ optional brightness / low-light). Apply INCREMENTALLY and shoot after each (revert any
+# with `flashrestore full_backup_4mb.bin 0x4b000 WRITE`), because each extra number sacrifices one more
+# page-1 init write (R B = AWB only; +AE adds 0xcb brightness; +MAXGAIN adds the 0x04 gain ceiling = 7 total).
+sudo venv/bin/python device/kdc_run.py awb full_backup_4mb.bin 0x88 0xd0              # 1) WB only, dry-run
+sudo venv/bin/python device/kdc_run.py awb full_backup_4mb.bin 0x88 0xd0 WRITE        #    commit, shoot indoors
+sudo venv/bin/python device/kdc_run.py awb full_backup_4mb.bin 0x88 0xd0 0x48 WRITE   # 2) +brightness (AE target; 0x45 dim..0x50 bright)
+sudo venv/bin/python device/kdc_run.py awb full_backup_4mb.bin 0x88 0xd0 0x48 0xa0 WRITE  # 3) +low-light gain cap (lower=cleaner/darker)
+#   too warm -> lower R (0x78) / raise B (0xe0). Always re-run with the ORIGINAL dump (it retunes from it).
+#   Omit a trailing number to drop that knob — but if you already flashed it, flashrestore 0x4b000 first.
 #   WB is now FIXED (auto-AWB off): great indoors, may look cool in daylight. After a resolution/mode
 #   change, recheck WB (a RAM reg-table replay may re-touch the sensor).
 
