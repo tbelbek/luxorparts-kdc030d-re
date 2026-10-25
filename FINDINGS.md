@@ -30,8 +30,11 @@ Detailed reverse-engineering notes behind the tooling. The README is the how-to;
 ## Firmware-wide delay audit
 - 54 fixed `delay()` call sites. Call-graph reachability (`tools/xref.py`) from the capture entry
   (0x020078cc → 301 functions) shows the **only** fixed delay on the photo-capture path is the settle
-  above. The other ~53 are boot / SD / display / audio settle times (off the photo path) — necessary
-  hardware timing, NOT safe to shorten.
+  above. The other ~53 are off the photo path. **Correction (Codex):** they are NOT all hardware settles —
+  a cluster of `delay(2000)`/`delay(1000)` in the capture/video region (0x02009xxx/0x0200cxxx, after calls
+  to the state fn 0x0204bf98) look like UI/status pauses that MIGHT be shortenable for snappier mode-switch
+  / record start-stop. They may equally be SD/DMA completion waits, so each needs tracing before touching
+  (see docs/IMPROVEMENTS.md #3). The genuine boot/SD/display/audio settles among the rest are real timing.
 
 ## Robustness guards (Task 5) — benign in THIS path; an opt-in deterministic guard is now shipped
 - **Delivered:** `flashpatch BACKUP 250 GUARD WRITE` applies the shutter fix AND hardens the settle: it
